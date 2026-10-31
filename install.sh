@@ -9,6 +9,8 @@
 #                   certificate; the name must already point at this server)
 #   --ref REF       the branch or tag of Miu to install (default: main)
 #   --repo URL      where to get Miu (default: https://github.com/akashmdiu/miu)
+#   --user NAME     the account Miu runs as (default: miu; an existing one is kept)
+#   --agent-user NAME  the account the AI agent runs as (default: miu-agent)
 #   --no-agent-user run the AI agent as Miu's own account (not recommended)
 #
 # What it sets up (docs/install.md has the detail):
@@ -27,12 +29,16 @@ MIU_REF="main"
 DOMAIN=""
 AGENT_USER_ON=1
 NODE_MAJOR=24
+MIU_USER=miu
+AGENT_USER=miu-agent
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN="${2:-}"; shift 2 ;;
     --ref) MIU_REF="${2:-}"; shift 2 ;;
     --repo) MIU_REPO="${2:-}"; shift 2 ;;
+    --user) MIU_USER="${2:-}"; shift 2 ;;
+    --agent-user) AGENT_USER="${2:-}"; shift 2 ;;
     --no-agent-user) AGENT_USER_ON=0; shift ;;
     -h|--help) sed -n '2,23p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -51,9 +57,9 @@ command -v systemctl >/dev/null || die "Miu needs systemd."
 case "$(uname -m)" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) die "Miu runs on x86_64 and arm64; this is $(uname -m)." ;; esac
 if [ -n "$DOMAIN" ] && ! [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then die "--domain takes a host name, like miu.example.com"; fi
 [[ "$MIU_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "--ref takes a branch or tag name"
+for u in "$MIU_USER" "$AGENT_USER"; do [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "not an account name: $u"; done
+[ "$MIU_USER" != "$AGENT_USER" ] || die "--user and --agent-user must differ"
 
-MIU_USER=miu
-AGENT_USER=miu-agent
 APP=/srv/miu
 OPT=/opt/miu
 ETC=/etc/miu
@@ -136,13 +142,18 @@ systemctl enable --now rexenv-headless.service >/dev/null
 # --------------------------------------------------------------------- miu
 say "Installing Miu ($MIU_REF)"
 git config --system --add safe.directory "$APP" 2>/dev/null || true
-if [ -d "$APP/.git" ]; then
-  git -C "$APP" fetch -q --depth 1 origin "$MIU_REF"
-  git -C "$APP" reset -q --hard FETCH_HEAD
-else
-  rm -rf "$APP"
-  git clone -q --depth 1 --branch "$MIU_REF" "$MIU_REPO" "$APP"
+if [ ! -d "$APP/.git" ]; then
+  # A folder without git (Miu copied in by hand): adopt it in place, so its
+  # runs/ and .cache/ (ignored by git) stay where they are.
+  install -d -m 0755 "$APP"
+  git -C "$APP" init -q
+  git -C "$APP" remote add origin "$MIU_REPO"
 fi
+git -C "$APP" remote set-url origin "$MIU_REPO"
+git -C "$APP" fetch -q --depth 1 origin "$MIU_REF"
+git -C "$APP" reset -q --hard FETCH_HEAD
+git -C "$APP" clean -fdq   # files of an older copy; ignored data stays
+chown root:root "$APP"
 (cd "$APP" && npm ci --silent --no-fund --no-audit --omit=dev >/dev/null)
 install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$APP/runs" "$APP/.cache"
 if [ "$AGENT_USER_ON" = 1 ]; then
@@ -260,6 +271,8 @@ if [ -n "$DOMAIN" ]; then
   setenv MIU_AUTH github
 fi
 
+# The unit below loads the key itself; an older drop-in that did would load it twice.
+rm -f /etc/systemd/system/miu.service.d/secrets.conf
 cat > /etc/systemd/system/miu.service <<EOF
 [Unit]
 Description=Miu, pull request QA
