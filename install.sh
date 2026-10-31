@@ -288,6 +288,15 @@ systemctl daemon-reload
 systemctl enable miu.service >/dev/null
 systemctl restart miu.service
 
+# ---------------------------------------------------------------- QA sites
+# The two WordPress sites every run uses. Made now, so the first test does not
+# wait while rexenv downloads MySQL and PHP; a second try finishes what a slow
+# first one left.
+say "Preparing the QA sites (the first time takes a few minutes)"
+prep() { (cd "$APP" && as_miu env HOME="$MIU_HOME" QA_CACHE_DIR="$APP/.cache" MIU_PROFILES="$ETC/profiles" timeout 1500 \
+  node --input-type=module -e 'await (await import("./lib/warmsites.mjs")).ensureSites(() => {}, ["pr", "dev"]);') >/tmp/miu-sites.log 2>&1; }
+prep || prep || say "The QA sites are not ready yet (see /tmp/miu-sites.log); the first test makes them."
+
 # ------------------------------------------------------------------- caddy
 if [ -n "$DOMAIN" ]; then
   if ! command -v caddy >/dev/null; then
