@@ -335,8 +335,10 @@ EOF
 fi
 
 # -------------------------------------------------------------------- done
-for _ in $(seq 1 30); do curl -fs -o /dev/null http://127.0.0.1:4747/ && break; sleep 1; done
-curl -fs -o /dev/null http://127.0.0.1:4747/ || die "Miu did not start; see: journalctl -u miu -n 50"
+# Any HTTP answer counts: with sign-in on, the page answers with the sign-in step.
+answers() { [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4747/)" != 000 ]; }
+for _ in $(seq 1 30); do answers && break; sleep 1; done
+answers || die "Miu did not start; see: journalctl -u miu -n 50"
 CODE=$(cat "$MIU_HOME/.config/miu/setup-code" 2>/dev/null || true)
 URL=${DOMAIN:+https://$DOMAIN}
 echo
