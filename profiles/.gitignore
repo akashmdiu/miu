@@ -1,0 +1,5 @@
+# Your profiles go here (docs/profiles.md).
+*.json
+*.md
+!project.json
+!.gitignore

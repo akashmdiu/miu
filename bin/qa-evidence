@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Evidence ledger for a QA run. Every command the agent wants to cite as proof
+# goes through here, so the report can only reference output that was really
+# captured in this run (methodology.md section 6, "no pass without evidence").
+#
+#   qa-evidence run   <label> -- <command...>     run and log a shell command
+#   qa-evidence http  <label> <curl args...>      curl with headers captured
+#   qa-evidence shot  <label> <url> [WxH] [login-url] [--mark "<css>|<note>"]...  screenshot + console log
+#   qa-evidence clip  <label> <steps.mjs> [WxH] [login-url]  short before/after GIF of a flow
+#   qa-evidence note  <label> <file>              attach an existing file
+#   qa-evidence list                              print the ledger
+#
+# Each call prints the evidence id (ev-001, ...) on the last line of stdout.
+set -uo pipefail
+
+EVIDENCE_DIR="${QA_EVIDENCE_DIR:-${QA_RUN_DIR:-$PWD/qa-run}/evidence}"
+LEDGER="$EVIDENCE_DIR/index.jsonl"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$EVIDENCE_DIR"
+touch "$LEDGER"
+
+next_id() {
+  local n
+  n=$(wc -l < "$LEDGER" | tr -d ' ')
+  printf 'ev-%03d' $((n + 1))
+}
+
+record() { # id kind label file exit extra_json
+  node -e '
+    const [id, kind, label, file, exit, extra] = process.argv.slice(1);
+    const fs = require("fs"), path = require("path");
+    // An image that was never written (a full disk) must not become evidence
+    // a report links to: say so, so the shot can be taken again.
+    if (/\.(png|jpe?g|webp|gif)$/i.test(file || "")) {
+      const p = path.join(path.dirname(process.env.LEDGER), file);
+      let size = 0; try { size = fs.statSync(p).size; } catch {}
+      if (!size) { console.error(`qa-evidence: ${file} was not saved (is the disk full?); not recorded as evidence. Take it again.`); process.exit(3); }
+    }
+    const row = { id, kind, label, file, exit: exit === "" ? null : Number(exit),
+                  at: new Date().toISOString(), ...JSON.parse(extra || "{}") };
+    fs.appendFileSync(process.env.LEDGER, JSON.stringify(row) + "\n");
+  ' "$@"
+}
+export LEDGER
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  run)
+    label="$1"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    id=$(next_id); file="$id.log"
+    {
+      printf '$ %s\n' "$*"
+      "$@" 2>&1
+      echo "[exit $?]"
+    } > "$EVIDENCE_DIR/$file"
+    # The whole output is the evidence; the agent sees the start and the end,
+    # because every line it reads is paid for again on every later turn.
+    lines=$(wc -l < "$EVIDENCE_DIR/$file" | tr -d ' ')
+    if (( lines > 80 )); then
+      head -n 25 "$EVIDENCE_DIR/$file"; echo "... ($((lines - 65)) lines cut; the full output is in evidence/$file) ..."; tail -n 40 "$EVIDENCE_DIR/$file"
+    else cat "$EVIDENCE_DIR/$file"; fi
+    code=$(tail -n1 "$EVIDENCE_DIR/$file" | sed -E 's/\[exit ([0-9]+)\]/\1/')
+    record "$id" cmd "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({cmd: process.argv.slice(1).join(" ")}))' "$@")"
+    echo "$id"
+    ;;
+  http)
+    label="$1"; shift
+    id=$(next_id); file="$id.http"
+    curl -sS -D - --max-time 60 "$@" -o "$EVIDENCE_DIR/$id.body" > "$EVIDENCE_DIR/$file" 2>&1
+    code=$?
+    { echo; echo "--- body (first 4000 bytes) ---"; head -c 4000 "$EVIDENCE_DIR/$id.body"; } >> "$EVIDENCE_DIR/$file"
+    status=$(head -n1 "$EVIDENCE_DIR/$file" | awk '{print $2}')
+    cat "$EVIDENCE_DIR/$file"
+    record "$id" http "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({status: process.argv[1] || null, args: process.argv.slice(2).join(" ")}))' "$status" "$@")"
+    echo "$id"
+    ;;
+  shot)
+    # Positional: label url [WxH] [login-url]; then any number of
+    # --mark "<css selector>|<short note>" to box and explain what to look at.
+    pos=(); marks=()
+    while (( $# )); do
+      if [[ "$1" == "--mark" ]]; then marks+=("$2"); shift 2; else pos+=("$1"); shift; fi
+    done
+    label="${pos[0]}"; url="${pos[1]}"; size="${pos[2]:-1280x800}"; auth="${pos[3]:-}"
+    marks_json=$(node -e 'console.log(JSON.stringify(process.argv.slice(1).map((m) => { const i = m.indexOf("|"); return i < 0 ? { selector: m, note: "" } : { selector: m.slice(0, i).trim(), note: m.slice(i + 1).trim() }; })))' "${marks[@]+"${marks[@]}"}")
+    id=$(next_id); file="$id.png"
+    QA_MARKS="$marks_json" node "$HERE/../lib/shot.mjs" "$url" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$EVIDENCE_DIR/$id.console.json"
+    code=$?
+    cat "$EVIDENCE_DIR/$id.console.json"
+    record "$id" shot "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({url: process.argv[1], size: process.argv[2], console: process.argv[3], marks: JSON.parse(process.argv[4])}))' "$url" "$size" "$id.console.json" "$marks_json")"
+    echo "$id"
+    ;;
+  clip)
+    label="$1"; steps="$2"; size="${3:-1280x800}"; auth="${4:-}"
+    id=$(next_id); file="$id.gif"
+    node "$HERE/../lib/clip.mjs" "$steps" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$EVIDENCE_DIR/$id.console.json"
+    code=$?
+    cat "$EVIDENCE_DIR/$id.console.json"
+    record "$id" clip "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({steps: require("path").basename(process.argv[1]), size: process.argv[2], console: process.argv[3]}))' "$steps" "$size" "$id.console.json")"
+    echo "$id"
+    ;;
+  note)
+    label="$1"; src="$2"
+    id=$(next_id); ext="${src##*.}"; file="$id.$ext"
+    cp "$src" "$EVIDENCE_DIR/$file" || exit 1
+    record "$id" file "$label" "$file" "" "{}"
+    echo "$id"
+    ;;
+  list)
+    cat "$LEDGER"
+    ;;
+  *)
+    sed -n '2,13p' "$0" >&2
+    exit 2
+    ;;
+esac

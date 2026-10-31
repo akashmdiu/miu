@@ -1,0 +1,9 @@
+{
+  "name": "My plugin",
+  "marker": "miu",
+  "cloudinary_folder": "miu",
+  "slack_channel": null,
+  "live_hosts": [],
+  "reset_dirs": [],
+  "reset_upload_prefix": null
+}

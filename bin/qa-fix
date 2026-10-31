@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+// qa-fix --run DIR --fix-dir DIR --model M [--auth plan|api] [--effort E]
+//        [--no-push] [--comment]
+//
+// Fixes what a finished QA run found, on the pull request's own branch:
+//   1. check   the run has findings, the branch is the repo's own and has not
+//              moved since the test
+//   2. prepare a worktree of the tested commit (lib/worktrees.mjs, slot "fix"),
+//              and for a plugin the QA site qa-fix.rex running it, with the
+//              other plugin at its base branch (slot "fixbase")
+//   3. agent   the fix agent reproduces each problem on the site, changes the
+//              code, checks the problem is gone, and writes fix.json; it has
+//              no token, no git that changes anything, and reaches only the site
+//   4. guard   what changed is checked (lib/fix.mjs checkChange, php -l), and
+//              every fix needs evidence from the site before and after
+//   5. push    Miu commits as the person whose GitHub sign-in can push, and
+//              pushes without force: a branch that moved refuses it
+//   6. tell    a comment on the pull request (--comment) and result.json
+//
+// --no-push stops after 4 and keeps the change as fix.patch.
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { validate, loadLedger, forMember } from '../lib/report.mjs';
+import { runAgent } from '../lib/agent.mjs';
+import { engineOf, ENGINES } from '../lib/engines.mjs';
+import { authFor, applyAuth, scrub, secrets, readSecret } from '../lib/connections.mjs';
+import { AGENT_USER, shareRunDir, agentBasePath } from '../lib/agentuser.mjs';
+import { readInstruction } from '../lib/instructions.mjs';
+import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
+import { fixToolRule } from '../lib/rules.mjs';
+import { findings, findingsMd, checkChange, commitMessage, outcome, branchProblem, checkProbe } from '../lib/fix.mjs';
+import { fetchRef, checkoutSlot, ensureDeps, CACHE, redact } from '../lib/worktrees.mjs';
+import { ensureSites, mount, reset } from '../lib/warmsites.mjs';
+import { profiles, profileOf } from '../lib/project.mjs';
+import { withRex } from '../lib/rexmcp.mjs';
+import { AGENT_QASITE } from '../lib/agentuser.mjs';
+import { collaborator } from '../lib/ghuser.mjs';
+import * as gh from '../lib/github.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const argv = process.argv.slice(2);
+const flag = (n) => argv.includes(n);
+const opt = (n, d) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : d; };
+
+const runDir = path.resolve(opt('--run', ''));
+const fixDir = path.resolve(opt('--fix-dir', ''));
+let model = opt('--model', 'claude-opus-5-5');
+if (!fs.existsSync(path.join(runDir, 'verdict.json')) || !opt('--fix-dir')) { console.error('usage: qa-fix --run DIR --fix-dir DIR --model M'); process.exit(2); }
+fs.mkdirSync(fixDir, { recursive: true });
+const log = (...a) => {
+  // Every line goes through the known secrets and the token pattern.
+  const line = redact(scrub(`[fix ${new Date().toISOString().slice(11, 19)}] ${a.join(' ')}`, secrets()));
+  console.log(line);
+  try { fs.appendFileSync(path.join(fixDir, 'run.log'), line + '\n'); } catch { /* disk full */ }
+};
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+const tested = readJson(path.join(runDir, 'context/pr.json'));
+const repo = tested.url.split('/').slice(3, 5).join('/');
+const pr = tested.number;
+const sha = tested.headRefOid;
+const { verdict, round = 1 } = readJson(path.join(runDir, 'verdict.json'));
+fs.writeFileSync(path.join(fixDir, 'qa-fix.json'), JSON.stringify({ pid: process.pid, model, repo, pr, sha, run: path.basename(runDir), by: opt('--by', null), started: new Date().toISOString() }));
+
+const base = { repo, pr, sha, run: path.basename(runDir), round, verdict, model };
+// The site goes back to clean, so nothing the fix left behind leaks into the next one.
+let site = null;
+async function cleanup() { if (site) await reset('fix').catch(() => {}); }
+async function finish(state, extra = {}) {
+  await cleanup();
+  const out = { ...base, state, at: new Date().toISOString(), ...extra, ...(extra.reason ? { reason: redact(scrub(extra.reason, secrets())) } : {}) };
+  fs.writeFileSync(path.join(fixDir, 'result.json'), JSON.stringify(out, null, 2));
+  log(`${state}${extra.reason ? `: ${extra.reason}` : ''}${extra.pushed ? ` ${extra.pushed.slice(0, 7)}` : ''}`);
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------- 1. check
+const now = await gh.getPr(repo, pr);
+// Without pushing, a fix of an older commit harms nothing (a try-out).
+if (now.headRefOid !== sha && !flag('--no-push')) await finish('moved', { reason: `the pull request moved to ${now.headRefOid.slice(0, 7)} after the test, so the findings may not apply` });
+if (now.headRefOid !== sha) log(`the pull request moved to ${now.headRefOid.slice(0, 7)}; fixing ${sha.slice(0, 7)} as a try-out, nothing is pushed`);
+const blocked = branchProblem(now, repo);
+if (blocked) await finish('refused', { reason: blocked });
+// A paired run's findings for this pull request: its own and the shared ones.
+const all = validate(readJson(path.join(runDir, 'results.json')) ?? { criteria: [], issues: [] }, loadLedger(runDir), runDir).results;
+const own = repo.split('/')[1];
+const mine = forMember(all, `${repo}#${pr}`, (ref) => {
+  const s = String(ref ?? '').toLowerCase();
+  const n = Number(s.match(/#\s*(\d+)/)?.[1] ?? s.match(/(\d+)\s*$/)?.[1]);
+  // The longest name first: "plugin" is in "plugin-pro".
+  const named = profiles().map((p) => p.repo.split('/')[1].toLowerCase()).sort((x, y) => y.length - x.length).find((x) => s.includes(x));
+  return n === pr && (!named || named === own) ? `${repo}#${pr}` : 'other';
+});
+const list = findings(mine);
+if (!list.length) await finish('nothing', { reason: 'the report has no blocker, major issue or failed claim for this pull request' });
+log(`${list.length} finding(s) to fix in ${repo}#${pr} at ${sha.slice(0, 7)} (${now.headRefName})`);
+fs.writeFileSync(path.join(fixDir, 'findings.json'), JSON.stringify(list, null, 2));
+fs.writeFileSync(path.join(fixDir, 'findings.md'), `# Findings to fix\n\n${findingsMd(list)}\n`);
+for (const f of ['report.md']) fs.copyFileSync(path.join(runDir, f), path.join(fixDir, f));
+fs.copyFileSync(path.join(runDir, 'context/diff.patch'), path.join(fixDir, 'diff.patch'));
+fs.writeFileSync(path.join(fixDir, 'pr.json'), JSON.stringify({ title: now.title, body: now.body, branch: now.headRefName, base: now.baseRefName, author: now.author?.login }, null, 2));
+
+// ---------------------------------------------------------------- 2. prepare
+const gitAuth = await gh.gitAuthEnv(repo);
+const gitFallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
+const depsEnv = { ...(await gh.composerAuthEnv(repo).catch(() => ({}))), ...process.env };
+const depsFallback = await gh.composerAuthEnv(repo, { fallback: true }).catch(() => null);
+let dir;
+try {
+  // Two fetches into one bare clone can trip over each other's lock.
+  for (let i = 1; ; i++) { try { fetchRef(repo, `refs/pull/${pr}/head`, gitAuth, gitFallback); break; } catch (e) { if (i >= 3) throw e; await new Promise((r) => setTimeout(r, 5000)); } }
+  dir = checkoutSlot(repo, 'fix', sha);
+  const did = ensureDeps(dir, { env: depsEnv, fallbackEnv: depsFallback });
+  log(`checkout ${sha.slice(0, 7)} in ${dir}${did.length ? ` (${did.join(', ')})` : ''}`);
+  if (AGENT_USER) {
+    shareRunDir(dir); shareRunDir(fixDir);
+    // The agent account must pass through runs/.fixes (mode 750, Miu's) to reach its own folder.
+    const r = spawnSync('setfacl', ['-m', `u:${AGENT_USER}:x`, path.dirname(fixDir)], { encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`setfacl on ${path.dirname(fixDir)} failed: ${(r.stderr || '').trim()}`);
+  }
+} catch (e) {
+  await finish('failed', { reason: `could not prepare the code: ${String(e.message).split('\n')[0].replace(/AUTHORIZATION: basic \S+/gi, 'AUTHORIZATION: ***').slice(0, 300)}` });
+}
+
+// The site the agent reproduces on and checks its fix on: qa-fix.rex, with
+// this checkout as the plugin and the other plugin at its base branch. An app
+// pull request has no such site; its fix rests on the checks alone.
+const profile = profileOf(repo);
+if (profile?.kind === 'wp-plugin' && !flag('--no-site')) {
+  try {
+    const plugins = { [profile.slug]: dir };
+    if (profile.sibling) {
+      const sib = profileOf(profile.sibling.repo);
+      const sibSha = fetchRef(profile.sibling.repo, sib?.base_branch ?? 'dev', await gh.gitAuthEnv(profile.sibling.repo), await gh.gitAuthEnv(profile.sibling.repo, { fallback: true }).catch(() => null));
+      const sibDir = checkoutSlot(profile.sibling.repo, 'fixbase', sibSha);
+      ensureDeps(sibDir, { env: { ...(await gh.composerAuthEnv(profile.sibling.repo).catch(() => ({}))), ...process.env }, fallbackEnv: await gh.composerAuthEnv(profile.sibling.repo, { fallback: true }).catch(() => null) });
+      plugins[profile.sibling.slug] = sibDir;
+      log(`${profile.sibling.label} ${sib?.base_branch ?? 'dev'} at ${sibSha.slice(0, 7)} beside it`);
+    }
+    await withRex(async (rex) => {
+      const st = await rex.call('stack_status');
+      const down = st.services.filter((x) => !x.optional && !x.running).map((x) => x.name);
+      if (down.length) throw new Error(`rexenv services not running: ${down.join(', ')}`);
+    });
+    site = (await ensureSites(log, ['fix'])).fix;
+    mount('fix', plugins);
+    await reset('fix');
+    site.runs = Object.fromEntries(Object.keys(plugins).map((k) => [k, k === profile.slug ? `this pull request at ${sha.slice(0, 7)}, being fixed` : `${profile.sibling.label} base branch`]));
+    fs.mkdirSync(path.join(fixDir, 'context'), { recursive: true });
+    fs.writeFileSync(path.join(fixDir, 'context/sites.json'), JSON.stringify({ fix: site }, null, 2));
+    log(`rexenv: ${site.domain} runs ${Object.values(site.runs).join(' + ')}`);
+  } catch (e) {
+    // Fixing blind on a plugin would push guesses: stop instead.
+    await finish('failed', { reason: `the QA site for fixing is not ready: ${String(e.message).split('\n')[0].slice(0, 300)}` });
+  }
+}
+// qa-evidence and qasite for the agent, as a test gets them.
+const binDir = path.join(fixDir, 'bin');
+fs.mkdirSync(binDir, { recursive: true });
+for (const [name, target] of [['qa-evidence', 'bin/qa-evidence'], ['qasite', 'bin/qasite']]) {
+  const exe = AGENT_USER && name === 'qasite' ? AGENT_QASITE : path.join(ROOT, target);
+  fs.writeFileSync(path.join(binDir, name), `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
+}
+if (AGENT_USER) shareRunDir(fixDir);
+
+// ---------------------------------------------------------------- 3. agent
+const engine = engineOf(model);
+let auth;
+try { auth = authFor(engine, opt('--auth', 'plan')); } catch (e) { await finish('failed', { reason: e.message }); }
+if (AGENT_USER && auth?.settings?.apiKeyHelper) auth = { ...auth, settings: undefined, env: { ...auth.env, ANTHROPIC_API_KEY: readSecret('claude', 'apiKey') } };
+const basePath = `${binDir}:${AGENT_USER ? agentBasePath() : process.env.PATH}`;
+// No GitHub, publishing or cloud token, and nothing of a session that started Miu.
+const env = Object.fromEntries(Object.entries({ ...process.env, PATH: basePath }).filter(([k]) => !/^(GH_|GITHUB_TOKEN|QA_REPO_TOKEN|CLOUDINARY|AGENT_NOTES|SLACK|AWS_|NPM_TOKEN|COMPOSER_AUTH|ACTIONS_|CLAUDECODE|CLAUDE_CODE_|CLAUDE_AGENT_SDK|CLAUDE_PID|CLAUDE_EFFORT)/.test(k)));
+// The worktree belongs to Miu's account; git refuses another account's
+// repository unless it is named safe, so the agent can read history and diffs.
+const agentEnv = applyAuth({ ...env, BASH_MAX_OUTPUT_LENGTH: '12000', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: dir, QA_RUN_DIR: fixDir, QA_EVIDENCE_DIR: path.join(fixDir, 'evidence'), QA_CACHE_DIR: CACHE, ...(AGENT_USER ? { MIU_AGENT_PATH: basePath } : {}) }, auth);
+const prompt = readInstruction('fix-agent', path.dirname(path.dirname(fixDir)))
+  .replace(/<!-- only:(\w+) -->\n?([\s\S]*?)\n?<!-- \/only -->\n?/g, (_, tag, body) => ((tag === 'site' ? !!site : tag === 'nosite' ? !site : true) ? body + '\n' : ''))
+  .replace(/<!-- engine:(\w+) -->\n?([\s\S]*?)\n?<!-- \/engine -->\n?/g, (_, tag, body) => (tag === engineOf(model) ? body + '\n' : ''))
+  + `\n\n---\n\nWorking directory (the pull request's code): ${dir}\nRun folder: ${fixDir}\nRepo: ${repo}  PR: #${pr}  branch: ${now.headRefName}  tested commit: ${sha}  round: ${round}\nFindings: ${list.map((f) => f.id).join(', ')}\n${site ? `QA site: ${site.domain} (${site.url}), site_id ${site.id}; it runs ${Object.entries(site.runs).map(([k, v]) => `${k}: ${v}`).join(', ')}. Your edits in the working directory are live on it.\n` : 'No QA site: this repo is not a WordPress plugin.\n'}`;
+fs.writeFileSync(path.join(fixDir, 'prompt.md'), prompt);
+const effort = ['low', 'medium', 'high', 'xhigh', 'max'].includes(opt('--effort', '')) ? opt('--effort', '') : undefined;
+log(`agent start (model ${model}, ${engine}${effort ? `, effort ${effort}` : ''})`);
+const { ok, result } = await runAgent({
+  prompt, runDir: fixDir, workDir: dir, model, env: agentEnv, log, settings: auth.settings, extraArgs: auth.args, effort,
+  rule: (name, input) => fixToolRule(name, input, { workDir: dir, fixDir }), rexenv: site ? 'site' : false,
+  maxTurns: Number(opt('--max-turns', '80')), timeoutMin: Number(opt('--timeout-min', '40')),
+  permissionMode: 'acceptEdits',
+});
+log(`agent exit ${ok ? 0 : 1} (${result?.subtype ?? 'no result'}${result?.num_turns ? `, ${result.num_turns} turns` : ''})`);
+const agent = readJson(path.join(fixDir, 'fix.json'));
+// Finished but said nothing: its last words are why (it could not read the findings, say).
+if (ok && !agent) await finish('failed', { reason: `the agent wrote no fix.json: ${String(result?.result ?? '').replace(/\s+/g, ' ').trim().slice(0, 300) || 'it gave no reason'}` });
+if (!ok && !agent) {
+  const refused = refusalIn(fixDir);
+  if (refused) recordRefusal(path.dirname(path.dirname(fixDir)), engine, opt('--auth', 'plan'), refused);
+  await finish('failed', { reason: refused ? `${ENGINES[engine]?.label ?? engine} refused Miu's sign-in (${refused})` : `the agent stopped (${result?.subtype ?? 'no result'}) before saying what it fixed` });
+}
+
+// ---------------------------------------------------------------- 4. guard
+const git = (args, o = {}) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...o });
+git(['add', '-A']);
+const numstat = git(['diff', '--cached', '--numstat']).stdout.trim().split('\n').filter(Boolean).map((l) => { const [a, r, p] = l.split('\t'); return { path: p, added: Number(a) || 0, removed: Number(r) || 0 }; });
+const patch = scrub(git(['diff', '--cached']).stdout, secrets());
+fs.writeFileSync(path.join(fixDir, 'fix.patch'), patch);
+// Miu replays each fix's probe itself: on the original code (the change
+// stashed) the problem must show, on the fix it must not. The agent's own
+// evidence is not enough: it can show anything, or show too little.
+const proofs = new Map();
+if (site && numstat.length) {
+  const replay = async (pr_) => {
+    await reset('fix');
+    return withRex(async (rex) => {
+      for (const args of pr_.setup) {
+        const r = await rex.call('site_wp_run', { site_id: site.id, args });
+        if (!r.succeeded && !/^Success:/m.test(r.stdout || '')) return { error: `setup wp ${args.join(' ').slice(0, 80)} failed: ${String(r.stderr || r.stdout || '').trim().slice(0, 160)}` };
+      }
+      if (pr_.wp) { const r = await rex.call('site_wp_run', { site_id: site.id, args: pr_.wp }); return { out: `${r.stdout || ''}\n${r.stderr || ''}` }; }
+      const h = Object.entries(pr_.http.headers).flatMap(([k, v]) => ['-H', `${k}: ${v}`]);
+      // Twice: the first request may only warm a cache the second one serves.
+      spawnSync('curl', ['-sk', '-o', '/dev/null', ...h, site.url + pr_.http.path], { timeout: 60000 });
+      const r = spawnSync('curl', ['-sk', '-D', '-', ...h, site.url + pr_.http.path], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 60000 });
+      return { out: r.stdout || '' };
+    });
+  };
+  const resolve = (id, seen = new Set()) => {
+    const x = (agent?.fixed ?? []).find((f) => f.id === id);
+    const c = checkProbe(x?.probe);
+    if (c.error) return c;
+    if (c.probe.same_as) return seen.has(id) ? { error: 'same_as goes round in a circle' } : resolve(c.probe.same_as, new Set([...seen, id]));
+    return c;
+  };
+  const record = [];
+  const settle = () => new Promise((r) => setTimeout(r, 2500)); // PHP sees the changed files
+  for (const x of agent?.fixed ?? []) {
+    const c = resolve(x.id);
+    if (c.error) { proofs.set(x.id, `its probe is not usable (${c.error})`); continue; }
+    try {
+      if (git(['stash', 'push', '--quiet']).status !== 0) throw new Error('could not set the change aside');
+      await settle();
+      const before = await replay(c.probe);
+      if (git(['stash', 'pop', '--quiet', '--index']).status !== 0) throw new Error('could not put the change back');
+      await settle();
+      const after = await replay(c.probe);
+      const hit = (o) => !o.error && c.probe.re.test(o.out);
+      const verdict = before.error || after.error ? (before.error || after.error)
+        : hit(before) ? 'the probe already matched on the original code, so it does not show the problem'
+        : !hit(after) ? 'the probe did not match with the fix either'
+        : true;
+      proofs.set(x.id, verdict);
+      record.push({ id: x.id, expect: c.probe.expect, check: c.probe.http ? `GET ${c.probe.http.path}` : `wp ${c.probe.wp.join(' ').slice(0, 120)}`, before: hit(before), after: hit(after), result: verdict === true ? 'proven' : verdict });
+      log(`replay ${x.id}: ${verdict === true ? 'problem on the original, gone with the fix' : verdict}`);
+    } catch (e) {
+      // The change must not be lost: fix.patch holds it, and the worktree is restored if it can be.
+      git(['stash', 'pop', '--quiet', '--index']);
+      await finish('failed', { reason: `replaying the fixes failed: ${e.message}` });
+    }
+  }
+  fs.writeFileSync(path.join(fixDir, 'replay.json'), JSON.stringify(record, null, 2));
+  git(['add', '-A']);
+}
+const { fixed, left } = outcome(agent, list, { site: !!site, proven: (id) => proofs.get(id) ?? 'no probe was replayed' });
+// A change claimed as a fix but not shown to work on the site stays out of the push.
+const unchecked = (agent?.fixed ?? []).filter((x) => left.some((l) => l.id === x.id && /not proven/.test(l.why)));
+const changed = { files: numstat.length, lines: numstat.reduce((n, f) => n + f.added + f.removed, 0) };
+const why = checkChange(numstat, patch);
+if (!fixed.length && numstat.length) why.push(unchecked.length ? 'no fix was proven on the site' : 'fix.json names no finding as fixed');
+else if (unchecked.length) why.push(`the change also holds ${unchecked.map((x) => x.id).join(', ')}, not proven on the site`);
+// A PHP file that does not parse would break every site that loads it.
+const php = spawnSync('bash', ['-lc', 'command -v php'], { encoding: 'utf8' }).stdout.trim();
+for (const f of numstat.filter((x) => x.path.endsWith('.php') && fs.existsSync(path.join(dir, x.path)))) {
+  if (!php) break;
+  const r = spawnSync(php, ['-l', path.join(dir, f.path)], { encoding: 'utf8' });
+  if (r.status !== 0) why.push(`${f.path} does not parse: ${(r.stdout + r.stderr).split('\n').find((l) => /error/i.test(l))?.trim().slice(0, 200) ?? 'php -l failed'}`);
+}
+if (!numstat.length) await finish('nothing', { fixed, left, reason: left.length ? `nothing changed: ${left.map((l) => `${l.id} ${l.why}`).join('; ')}` : 'nothing changed' });
+if (why.length) await finish('kept', { fixed, left, changed, reason: why.join('; ') });
+if (flag('--no-push')) await finish('kept', { fixed, left, changed, reason: 'pushing is off; the change is kept as a patch' });
+
+// ---------------------------------------------------------------- 5. push
+// Who pushes: only the person connected under GitHub and notices, never
+// another token, so a fix made on their behalf is theirs end to end: the
+// commit, the push and the comment. Their sign-in goes through the Miu App,
+// so the App needs Contents: Read and write as well as the person.
+const collab = collaborator();
+if (!collab) await finish('kept', { fixed, left, changed, reason: 'no GitHub account is connected: connect yours under Settings, GitHub and notices' });
+let who;
+try {
+  const [me, r] = await Promise.all([gh.rest('GET', 'user', { token: collab.token }), gh.rest('GET', `repos/${repo}`, { token: collab.token })]);
+  if (!r?.permissions?.push) await finish('kept', { fixed, left, changed, reason: `${me.login} has no write access to ${repo}` });
+  who = { token: collab.token, login: me.login, name: me.name || me.login, email: `${me.id}+${me.login}@users.noreply.github.com` };
+} catch (e) {
+  await finish('kept', { fixed, left, changed, reason: `the connected GitHub account could not be read: ${String(e.message).split('\n')[0].slice(0, 160)}` });
+}
+const msgFile = path.join(fixDir, 'commit.txt');
+fs.writeFileSync(msgFile, scrub(commitMessage(agent, fixed.map((f) => list.find((x) => x.id === f.id)), { round, sha }), secrets()));
+const c = git(['-c', `user.name=${who.name}`, '-c', `user.email=${who.email}`, 'commit', '--quiet', '--no-verify', '-F', msgFile]);
+if (c.status !== 0) await finish('failed', { fixed, left, changed, reason: `git commit failed: ${(c.stderr || c.stdout).trim().slice(0, 200)}` });
+const commit = git(['rev-parse', 'HEAD']).stdout.trim();
+// The person's own token, when saved: the App sign-in can push only if the
+// App may write code. Still theirs alone: it must name the same login.
+const ownToken = readSecret('github', 'pushToken');
+let pushWith = who.token, via = 'GitHub sign-in';
+if (ownToken) {
+  try { const me = await gh.rest('GET', 'user', { token: ownToken }); if (String(me.login).toLowerCase() === who.login.toLowerCase()) { pushWith = ownToken; via = 'personal token'; } else log(`the saved push token is ${me.login}'s, not ${who.login}'s; not used`); }
+  catch (e) { log(`the saved push token was not accepted: ${String(e.message).split('\n')[0].slice(0, 120)}`); }
+}
+const basic = Buffer.from(`x-access-token:${pushWith}`).toString('base64');
+const authEnv = { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`, GIT_TERMINAL_PROMPT: '0' };
+// No force: GitHub refuses the push when the branch moved since the test.
+const pr_ = git(['push', '--quiet', `https://github.com/${repo}.git`, `${commit}:refs/heads/${now.headRefName}`], { env: authEnv });
+const last = (pr_.stderr || pr_.stdout || '').replace(/AUTHORIZATION: basic \S+/gi, 'AUTHORIZATION: ***').trim();
+if (pr_.status !== 0 && /non-fast-forward|fetch first|rejected/i.test(last) && !/denied|403/i.test(last)) await finish('moved', { fixed, left, changed, reason: 'the branch moved while Miu was fixing it; a person\'s commit wins, so nothing was pushed' });
+if (pr_.status !== 0) await finish('kept', { fixed, left, changed, reason: /denied|403/i.test(last)
+  ? (via === 'personal token' ? `GitHub refused the push from ${who.login}'s personal token: it needs the repo scope, or Contents: Read and write on this repo` : `GitHub refused the push from ${who.login}: save ${who.login}'s own personal token under Settings, GitHub and notices (an App sign-in can push only when the Miu App may write code)`)
+  : `the push was refused: ${last.split('\n').find((l) => /protected|error|refused/i.test(l))?.slice(0, 200) ?? last.slice(0, 200)}` });
+const pushed = commit, as = who.login;
+log(`pushed ${commit.slice(0, 7)} to ${now.headRefName} as ${as} (${via})`);
+
+// ---------------------------------------------------------------- 6. tell
+let comment = null;
+if (flag('--comment')) {
+  const body = [
+    `${now.author?.login && now.author.login !== as ? `@${now.author.login} ` : ''}Miu fixed ${fixed.length === list.length ? (list.length === 1 ? 'the problem' : `all ${list.length} problems`) : `${fixed.length} of ${list.length} problems`} its test found at \`${sha.slice(0, 7)}\`, and pushed [\`${commit.slice(0, 7)}\`](https://github.com/${repo}/commit/${commit}) to \`${now.headRefName}\`.`,
+    '',
+    ...fixed.map((f) => `- **Fixed:** ${f.title}${f.how ? `\n  ${f.how}` : ''}`),
+    ...left.map((f) => `- **Not fixed:** ${f.title}\n  ${f.why}`),
+    '',
+    'Miu tests the new commit next. To undo it, revert that commit.',
+    '',
+    `<sub>Miu, fixing round ${round}</sub>`,
+    `<!-- miu-fix sha=${sha} commit=${commit} -->`,
+  ].join('\n');
+  try { comment = (await gh.rest('POST', `repos/${repo}/issues/${pr}/comments`, { body: { body: scrub(body, secrets()) }, token: who.token })).html_url; log(`commented ${comment}`); }
+  catch (e) { log(`comment not posted: ${e.message.split('\n')[0]}`); }
+}
+await finish('pushed', { fixed, left, changed, pushed, as, branch: now.headRefName, comment });

@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+// qa-report <run-dir> [--report-url URL] [--run-url URL]
+//
+// Reads <run-dir>/results.json and <run-dir>/evidence/index.jsonl, applies the
+// evidence rule and the verdict rules, and writes:
+//   <run-dir>/comment.md   the PR comment
+//   <run-dir>/report.md    the full report
+//   <run-dir>/verdict.json { verdict, problems, counts }
+import fs from 'node:fs';
+import path from 'node:path';
+import { validate, computeVerdict, renderComment, renderFull, loadLedger } from '../lib/report.mjs';
+
+const args = process.argv.slice(2);
+const runDir = path.resolve(args[0] ?? 'qa-run');
+const opt = (name) => { const i = args.indexOf(name); return i > -1 ? args[i + 1] : undefined; };
+
+const ledger = loadLedger(runDir);
+let raw;
+const resultsFile = path.join(runDir, 'results.json');
+try {
+  raw = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
+} catch (e) {
+  // The agent died or wrote nothing usable. That is an infrastructure result.
+  raw = {
+    repo: process.env.QA_REPO ?? '?', pr: process.env.QA_PR ?? '?', head_sha: process.env.QA_HEAD_SHA ?? '?',
+    criteria: [], environments: [], issues: [],
+    infra_problems: [{ what: `The agent did not produce a readable results.json (${e.code ?? e.message})`, blocking: true }],
+  };
+}
+
+const { results, problems } = validate(raw, ledger, runDir);
+const verdict = computeVerdict(results);
+const reportUrl = opt('--report-url');
+const runUrl = opt('--run-url');
+
+fs.writeFileSync(path.join(runDir, 'comment.md'), renderComment(results, verdict, { reportUrl, runUrl, problems }) + '\n');
+fs.writeFileSync(path.join(runDir, 'report.md'), renderFull(results, verdict, { problems, ledger, runDir }) + '\n');
+const counts = {
+  criteria: results.criteria.length,
+  issues: Object.fromEntries(['blocker', 'major', 'minor', 'nit'].map((s) => [s, results.issues.filter((i) => i.severity === s && !i.unconfirmed).length])),
+  evidence: ledger.size,
+};
+fs.writeFileSync(path.join(runDir, 'verdict.json'), JSON.stringify({ verdict, problems, counts }, null, 2) + '\n');
+console.log(JSON.stringify({ verdict, problems: problems.length, ...counts }));

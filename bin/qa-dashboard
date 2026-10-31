@@ -1,0 +1,1594 @@
+#!/usr/bin/env node
+// qa-dashboard [--port 4747] [--runs DIR]
+//
+// Local page for QA runs. Lists the open pull requests in the three repos,
+// tests new ones and new commits automatically (one at a time), lets you
+// watch the agent, switch its model mid-run, and read the result. Reads and writes only the run
+// directories bin/qa-run uses. Listens on 127.0.0.1 only.
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
+import { screenshots, validate, loadLedger } from '../lib/report.mjs';
+import { withRex } from '../lib/rexmcp.mjs';
+import { postRun } from '../lib/postrun.mjs';
+import { qaSignals, prHistory } from '../lib/prsignals.mjs';
+import { partnersOf, roleOf } from '../lib/pairs.mjs';
+import { project, profiles, roles } from '../lib/project.mjs';
+import { addProfile } from '../lib/newprofile.mjs';
+import { MODELS, ENGINES, EFFORTS, engineOf } from '../lib/engines.mjs';
+import * as conn from '../lib/connections.mjs';
+import { rmAny } from '../lib/agentuser.mjs';
+import { listInstructions, saveInstruction } from '../lib/instructions.mjs';
+import * as cloud from '../lib/cloudinary.mjs';
+import * as ghuser from '../lib/ghuser.mjs';
+import * as prRules from '../lib/prrules.mjs';
+import { refusal } from '../lib/authrefused.mjs';
+import * as users from '../lib/users.mjs';
+import { cloudinaryUrl } from '../lib/publish.mjs';
+import * as gh from '../lib/github.mjs';
+import * as fixLib from '../lib/fix.mjs';
+import * as steer from '../lib/steer.mjs';
+import * as auth from '../lib/auth.mjs';
+import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
+import crypto from 'node:crypto';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const argv = process.argv.slice(2);
+const opt = (n, d) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : d; };
+const PORT = Number(opt('--port', 4747));
+// 127.0.0.1 unless told otherwise; anything else turns sign-in on (lib/auth.mjs).
+const HOST = opt('--host', process.env.MIU_HOST || '127.0.0.1');
+const RUNS = path.resolve(opt('--runs', path.join(ROOT, 'runs')));
+
+// Repos Miu can test are the ones with a test profile (lib/project.mjs);
+// the settings choose which of those it does test (all of them by default).
+function profiled() {
+  return new Map(profiles().filter((p) => gh.validRepo(p.repo)).map((p) => [p.repo, { file: p.file, kind: p.kind, label: p.label, role: p.role }]));
+}
+const repos = () => { const p = profiled(), on = getConfig().repos; return [...p.keys()].filter((r) => !Array.isArray(on) || on.includes(r)); };
+
+const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } };
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+const safeName = (n) => /^[\w.-]+$/.test(n) ? n : null;
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const runMeta = (dir) => readJson(path.join(dir, 'qa-run.json'));
+// A run is live while its own qa-run process is: the process itself, checked
+// by its command line (a reused pid is not it), not files in the folder,
+// which the agent can write too.
+function runAlive(dir, m = runMeta(dir)) {
+  if (!m?.pid || !alive(m.pid)) return false;
+  let cmd = '';
+  try { cmd = fs.readFileSync(`/proc/${m.pid}/cmdline`, 'utf8'); } catch { cmd = spawnSync('ps', ['-o', 'args=', '-p', String(m.pid)], { encoding: 'utf8' }).stdout || ''; }
+  return cmd.includes('qa-run') && cmd.includes(path.basename(dir));
+}
+const isLive = (dir) => runAlive(dir) && !fs.existsSync(path.join(dir, 'waiting.json'));
+const lines = (f) => (read(f) ?? '').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+const VERDICT_WORDS = { ok: 'Found OK', partial: 'Found partially OK', not_ok: 'Found NOT OK', already_fixed: 'Already fixed on dev', inconclusive: 'No result', no_result: 'No result' };
+
+// The disk Miu writes runs to: a run, its sites and builds need several GB,
+// and a full disk stops even saving a setting (ENOSPC).
+function diskState() {
+  try {
+    const s = fs.statfsSync(RUNS);
+    const free = s.bavail * s.bsize, total = s.blocks * s.bsize;
+    return { freeGB: Math.round(free / 1e8) / 10, usedPct: Math.round((1 - free / total) * 100) };
+  } catch { return null; }
+}
+
+function liveRun() {
+  if (fs.existsSync(RUNS)) {
+    const named = fs.readdirSync(RUNS, { withFileTypes: true }).filter((d) => d.isDirectory() && isLive(path.join(RUNS, d.name))).map((d) => d.name)[0];
+    if (named) return named;
+  }
+  // A run started from a terminal, or before qa-run.json existed.
+  const ps = spawnSync('pgrep', ['-f', 'bin/qa-run '], { encoding: 'utf8' });
+  return ps.status === 0 && ps.stdout.trim() ? 'started from a terminal' : null;
+}
+
+// Stage log: <run>/run.log, or the older <root>/runs-<name>.log.
+function runLog(dir, name) {
+  return read(path.join(dir, 'run.log')) ?? (read(path.join(ROOT, `runs-${name}.log`)) ?? '')
+    .split('\n').filter((l) => l.startsWith('[qa ')).join('\n');
+}
+
+const STAGES = [
+  { id: 'gather', label: 'Read the PR', match: /\] gather / },
+  { id: 'build', label: 'Code', match: /\] (build|checkout) / },
+  { id: 'env', label: 'Test site', match: /\] ((wp|hub) env|rexenv)/ },
+  { id: 'agent', label: 'Test running', match: /\] agent start/ },
+  { id: 'report', label: 'Report', match: /\] verdict / },
+];
+
+const posting = new Set();
+
+function status(dir, name) {
+  const log = runLog(dir, name);
+  const verdict = readJson(path.join(dir, 'verdict.json'));
+  const meta = runMeta(dir);
+  const history = lines(path.join(dir, 'models.jsonl'));
+  const reached = STAGES.filter((s) => s.match.test(log)).map((s) => s.id);
+  let state = 'running';
+  const going = runAlive(dir, meta);
+  if (verdict && !going) state = 'done';
+  else if (fs.existsSync(path.join(dir, 'conflict.json'))) state = 'conflict';
+  // qa-run found something the test needs missing and did not start (waiting.json).
+  else if (fs.existsSync(path.join(dir, 'waiting.json'))) state = 'waiting';
+  else if (!going && (/stopped from the dashboard/.test(log) || meta)) state = 'stopped';
+  else if (!meta) {
+    const files = ['run.log', 'agent-transcript.jsonl', 'notes.md'].map((f) => path.join(dir, f)).concat(path.join(ROOT, `runs-${name}.log`));
+    const mtime = Math.max(0, ...files.map((f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } }));
+    if (Date.now() - mtime > 20 * 60 * 1000) state = 'stalled';
+  }
+  const live = state === 'running' && !!meta && alive(meta.pid);
+  return {
+    state, reached, verdict: state === 'running' ? null : verdict?.verdict ?? null, history,
+    crashed: state === 'stopped' && !/stopped from the dashboard/.test(log),
+    waiting: state === 'waiting' ? readJson(path.join(dir, 'waiting.json')) : null,
+    last: (log.trim().split('\n').pop() ?? '').replace(/^\[qa [\d:]+\] /, ''),
+    // What the run is doing, in plain words, for the PR list (the raw log line
+    // is on the run page).
+    phase: state !== 'running' ? null
+      : /\] verdict /.test(log) ? 'Writing the report'
+      : /\] instruction pass \d+\n(?![\s\S]*\] instruction pass \d+ exit)/.test(log + '\n') ? 'Following an instruction'
+      : /\] resolve pass \d+:/.test(log) && !/\] resolve pass \d+ exit[^\n]*\n(?![\s\S]*\] resolve pass \d+:)/.test(log) ? 'Settling open claims'
+      : /\] agent finish pass:/.test(log) ? 'Writing results'
+      : /\] agent start/.test(log) ? 'Testing'
+      : /\] ((wp|hub) env|rexenv)/.test(log) ? 'Preparing the test sites'
+      : /\] (build|checkout) /.test(log) ? 'Preparing the code'
+      : /\] gather /.test(log) ? 'Reading the pull request' : 'Starting',
+    startedAt: meta?.started ?? null,
+    model: verdict?.model ?? history.at(-1)?.model ?? meta?.model ?? log.match(/agent start \(model ([\w.-]+)\)/)?.[1] ?? null,
+    // A run can change model only within its engine, and only where the engine allows it.
+    // A person can still tell the agent something until it has run for the last time.
+    steerable: live && !steer.isClosed(dir),
+    stoppable: live, switchable: live && history.length > 0 && ENGINES[engineOf(history.at(-1)?.model)]?.switchable,
+    // A dry run that finished with a result can still go to the pull request.
+    posted: readJson(path.join(dir, 'posted.json')),
+    postable: state === 'done' && !!verdict && !['inconclusive', 'no_result'].includes(verdict.verdict) && !posting.has(name),
+    posting: posting.has(name),
+  };
+}
+
+// Tokens, time and plan usage from the transcript. A message's usage can
+// arrive in pieces, so each message counts with its largest numbers.
+const usageCache = new Map();
+function usage(dir) {
+  // A transcript past its keep time leaves its numbers in usage.json.
+  let stamp; try { stamp = fs.statSync(path.join(dir, 'agent-transcript.jsonl')).mtimeMs; } catch { return readJson(path.join(dir, 'usage.json')); }
+  const hit = usageCache.get(dir);
+  if (hit && hit.stamp === stamp) return hit.value;
+  const value = readUsage(dir);
+  usageCache.set(dir, { stamp, value });
+  return value;
+}
+
+function readUsage(dir) {
+  const raw = read(path.join(dir, 'agent-transcript.jsonl'));
+  if (!raw) return null;
+  const msgs = new Map();
+  const uses = new Map();
+  let firstTs = null, lastTs = null, toolMs = 0, plan = null, result = null;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    const t = ev.timestamp ? Date.parse(ev.timestamp) : null;
+    if (t) { firstTs ??= t; lastTs = t; }
+    if (ev.rate_limit_info) plan = ev.rate_limit_info;
+    // A run that needed a finish pass has two results; together they are the run.
+    if (ev.type === 'result') result = result ? { ...ev, duration_ms: (result.duration_ms ?? 0) + (ev.duration_ms ?? 0), usage: Object.fromEntries(['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'].map((k) => [k, (result.usage?.[k] ?? 0) + (ev.usage?.[k] ?? 0)])) } : ev;
+    if (ev.type === 'assistant' && ev.message?.id) {
+      const u = ev.message.usage ?? {};
+      const m = msgs.get(ev.message.id) ?? { out: 0, inp: 0, cr: 0, cw: 0 };
+      msgs.set(ev.message.id, { out: Math.max(m.out, u.output_tokens ?? 0), inp: Math.max(m.inp, u.input_tokens ?? 0), cr: Math.max(m.cr, u.cache_read_input_tokens ?? 0), cw: Math.max(m.cw, u.cache_creation_input_tokens ?? 0) });
+      for (const c of ev.message.content ?? []) if (c.type === 'tool_use' && t) uses.set(c.id, t);
+    }
+    if (ev.type === 'user' && t) {
+      for (const c of ev.message?.content ?? []) if (c.type === 'tool_result' && uses.has(c.tool_use_id)) toolMs += t - uses.get(c.tool_use_id);
+    }
+  }
+  const list = [...msgs.values()];
+  const sum = (k) => list.reduce((a, m) => a + m[k], 0);
+  const last = list.at(-1);
+  const ru = result?.usage;
+  const wallMs = result?.duration_ms ?? (firstTs && lastTs ? lastTs - firstTs : 0);
+  return {
+    calls: list.length,
+    output: ru?.output_tokens ?? sum('out'),
+    read: (ru?.cache_read_input_tokens ?? sum('cr')) + (ru?.cache_creation_input_tokens ?? sum('cw')) + (ru?.input_tokens ?? sum('inp')),
+    cacheRead: ru?.cache_read_input_tokens ?? sum('cr'),
+    context: last ? last.inp + last.cr + last.cw : 0,
+    wallMs, toolMs: Math.min(toolMs, wallMs), modelMs: Math.max(0, wallMs - toolMs),
+    plan: plan ? { fiveHour: plan.unifiedWindows?.five_hour?.utilization, sevenDay: plan.unifiedWindows?.seven_day?.utilization, status: plan.status } : null,
+    final: !!result,
+  };
+}
+
+// When a run happened: when it finished (verdict.json), or when it started.
+// Not the folder's own time, which pruning a run's work folders moves.
+function runTime(dir) {
+  const st = (f) => { try { return fs.statSync(path.join(dir, f)).mtimeMs; } catch { return null; } };
+  return st('verdict.json') ?? (Date.parse(runMeta(dir)?.started ?? '') || null) ?? st('context/pr.json') ?? st('run.log') ?? st('.');
+}
+
+function listRuns() {
+  if (!fs.existsSync(RUNS)) return [];
+  return fs.readdirSync(RUNS, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => {
+    const dir = path.join(RUNS, d.name);
+    const pr = readJson(path.join(dir, 'context/pr.json'));
+    const st = status(dir, d.name);
+    const u = usage(dir);
+    // A live run has no result yet, whatever files the agent left in its folder.
+    const sm = st.state === 'running' ? null : summary(dir);
+    return {
+      name: d.name, title: pr?.title ?? d.name, number: pr?.number, repo: pr?.url?.split('/').slice(3, 5).join('/'), author: pr?.author?.login ?? null,
+      state: st.state, crashed: st.crashed, waiting: st.waiting, phase: st.phase, startedAt: st.startedAt, verdict: st.verdict, model: st.model, mtime: runTime(dir), minutes: u ? Math.round(u.wallMs / 60000) : null,
+      passed: sm ? sm.claims.filter((c) => c.state === 'pass').length : null,
+      failed: sm ? sm.claims.filter((c) => c.state === 'fail').length : null,
+      issues: sm ? sm.issues.length : null,
+      last: st.state === 'running' ? st.last : null,
+      conflictKind: st.state === 'conflict' ? readJson(path.join(dir, 'conflict.json'))?.kind ?? 'conflict' : null,
+    };
+  }).sort((a, b) => b.mtime - a.mtime);
+}
+
+// What the agent did, from its transcript.
+function activity(dir) {
+  const raw = read(path.join(dir, 'agent-transcript.jsonl'));
+  if (!raw) return [];
+  const items = [];
+  const byId = new Map();
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    const at = ev.timestamp ?? null;
+    if (ev.type === 'assistant') {
+      for (const c of ev.message?.content ?? []) {
+        if (c.type === 'text' && c.text.trim()) {
+          const t = c.text.trim();
+          const ph = t.match(/^\**\s*Phase (\d+)\s*[:.]\s*([^\n*]+)/i);
+          if (ph) items.push({ kind: 'phase', n: Number(ph[1]), title: ph[2].trim(), at });
+          const rest = ph ? t.slice(t.indexOf(ph[0]) + ph[0].length).replace(/^\**\s*/, '').trim() : t;
+          if (rest) items.push({ kind: 'say', text: rest, at });
+        }
+        if (c.type === 'thinking' && (c.thinking || '').trim()) items.push({ kind: 'think', text: c.thinking.trim(), at });
+        if (c.type === 'tool_use' && !byId.has(c.id)) {
+          const inp = c.input ?? {};
+          const m = c.name.match(/^mcp__([^_]+(?:-[^_]+)*)__(.+)$/);
+          let item;
+          if (m) {
+            // An MCP call: server, tool and the arguments that matter, the way
+            // Claude Code prints them.
+            const a = { ...inp }; delete a.site_id;
+            const detail = inp.args ? 'wp ' + (Array.isArray(inp.args) ? inp.args.join(' ') : String(inp.args)) : inp.sql ? inp.sql : inp.name ? inp.name : inp.source ? inp.source : inp.slug ? inp.slug : Object.keys(a).length ? JSON.stringify(a) : '';
+            item = { kind: 'tool', mcp: m[1], tool: m[2], what: detail, cmd: '', input: inp, status: 'pending', at };
+          } else {
+            item = { kind: 'tool', tool: c.name, what: inp.description ?? inp.file_path ?? inp.pattern ?? inp.query ?? '', cmd: inp.command ?? '', status: 'pending', at };
+          }
+          byId.set(c.id, item);
+          items.push(item);
+        }
+      }
+    } else if (ev.type === 'user' && ev.steer) {
+      items.push({ kind: 'steer', by: ev.by ?? '', text: ev.message?.content?.[0]?.text ?? '', at });
+    } else if (ev.type === 'user') {
+      for (const c of ev.message?.content ?? []) {
+        const item = c.type === 'tool_result' && byId.get(c.tool_use_id);
+        if (!item) continue;
+        item.status = c.is_error ? 'error' : 'ok';
+        const text = typeof c.content === 'string' ? c.content : (c.content ?? []).map((x) => x.text ?? '').join('\n');
+        item.out = text.slice(0, 6000);
+      }
+    } else if (ev.type === 'result') {
+      items.push({ kind: 'end', text: `Testing finished (${ev.subtype})`, at });
+    }
+  }
+  return items.slice(-400);
+}
+
+// The agent's results, shaped for the summary.
+// Validating a run reads its whole ledger; the run list asks every 3 seconds,
+// so the result is kept until results.json or the ledger changes.
+const summaryCache = new Map();
+function summary(dir) {
+  const mt = (f) => { try { return fs.statSync(path.join(dir, f)).mtimeMs; } catch { return 0; } };
+  const stamp = `${mt('results.json')}:${mt('evidence/index.jsonl')}`;
+  const hit = summaryCache.get(dir);
+  if (hit && hit.stamp === stamp) return hit.value;
+  const value = buildSummary(dir);
+  summaryCache.set(dir, { stamp, value });
+  return value;
+}
+
+function buildSummary(dir) {
+  const raw = readJson(path.join(dir, 'results.json'));
+  if (!raw) return null;
+  // The same checks the report applies, so the dashboard never shows a pass
+  // the report downgraded.
+  let r = raw;
+  try { r = validate(raw, loadLedger(dir), dir).results; } catch { /* show it as written */ }
+  const cells = (c) => Object.values(c.results ?? {});
+  const passed = (c) => cells(c).some((x) => x.status === 'pass') && cells(c).every((x) => ['pass', 'not_run', 'skipped', 'untestable'].includes(x.status));
+  const setAside = (c) => cells(c).some((x) => x.status === 'untestable') && cells(c).every((x) => ['untestable', 'skipped'].includes(x.status));
+  const failed = (c) => cells(c).some((x) => x.status === 'fail');
+  const order = ['blocker', 'major', 'minor', 'nit'];
+  return {
+    context: r.context_line ?? '',
+    claims: (r.criteria ?? []).map((c) => ({
+      id: c.id, claim: c.claim, state: failed(c) ? 'fail' : passed(c) ? 'pass' : setAside(c) ? 'untestable' : 'open', carried: c.carried_from ?? null,
+      evidence: [...new Set(cells(c).flatMap((x) => x.evidence ?? []))],
+      before: [...new Set(c.baseline?.evidence ?? [])],
+      results: Object.entries(c.results ?? {}).map(([env, x]) => ({ env: (r.environments ?? []).find((e) => e.id === env)?.label ?? env, status: x.status, note: x.note ?? '', evidence: x.evidence ?? [] })),
+      baseline: c.baseline ? { status: c.baseline.status, note: c.baseline.note ?? '', evidence: c.baseline.evidence ?? [] } : null,
+    })),
+    issues: [...(r.issues ?? [])].sort((a, b) => order.indexOf(a.severity) - order.indexOf(b.severity)).map((i) => ({
+      severity: i.severity, title: i.title, impact: i.user_impact, claim: i.claim_broken, steps: i.steps ?? [], fix: i.suggested_fix ?? null,
+      evidence: [...new Set([...(i.evidence ?? []), ...((i.before_after?.images ?? []).filter((x) => /^ev-p?\d+$/.test(x ?? '')))])],
+    })),
+    notCovered: r.not_covered ?? [],
+    environments: (r.environments ?? []).map((e) => e.label),
+  };
+}
+
+function detail(name) {
+  const dir = path.join(RUNS, name);
+  if (!fs.existsSync(dir)) return null;
+  const ledger = lines(path.join(dir, 'evidence/index.jsonl'));
+  const cloud = readJson(path.join(dir, 'screenshots.json')) ?? {};
+  const builds = fs.existsSync(path.join(dir, 'context/builds'))
+    ? fs.readdirSync(path.join(dir, 'context/builds')).filter((f) => f.endsWith('.json')).map((f) => readJson(path.join(dir, 'context/builds', f))).filter(Boolean)
+    : [];
+  // Image paths in the reports are relative to the run dir.
+  const rewire = (md) => md?.replace(/\]\(evidence\//g, `](/evidence/${encodeURIComponent(name)}/`) ?? null;
+  return {
+    name,
+    fixes: listFixes().filter((f) => f.run === name),
+    steer: steer.list(dir),
+    pr: readJson(path.join(dir, 'context/pr.json')),
+    triage: readJson(path.join(dir, 'context/triage.json')),
+    builds,
+    status: status(dir, name),
+    stages: STAGES.map(({ id, label }) => ({ id, label })),
+    log: runLog(dir, name),
+    fast: read(path.join(dir, 'context/fast-checks.md')),
+    notes: read(path.join(dir, 'notes.md')),
+    prompt: read(path.join(dir, 'prompt.md')),
+    comment: rewire(read(path.join(dir, 'comment.md'))),
+    report: rewire(read(path.join(dir, 'report.md'))),
+    summary: summary(dir),
+    reviews: readJson(path.join(dir, 'reviews.json')) ?? {},
+    retest: (({ round, sha, changed_files, changed_by_file } = {}) => (round ? { round, sha, changed_files, changed_by_file } : null))(readJson(path.join(dir, 'context/retest.json')) ?? undefined),
+    posted: readJson(path.join(dir, 'posted.json')),
+    shots: screenshots(new Map(ledger.map((e) => [e.id, e])), dir).map((s) => ({ ...s, cloud: cloud[s.file] ?? null, marks: (ledger.find((e) => e.id === s.id)?.marks ?? []).filter((m) => m.note) })),
+    evidence: ledger.filter((e) => !/\.(png|jpe?g|webp|gif)$/i.test(e.file ?? '')),
+    activity: activity(dir),
+    usage: usage(dir),
+    // The models this run could switch to: its own engine's.
+    models: MODELS.filter((m) => m.engine === engineOf(lines(path.join(dir, 'models.jsonl')).at(-1)?.model)),
+  };
+}
+
+// ---- settings and automatic testing ---------------------------------------
+// runs/.config.json: { autoTest, model, post }. Posting is off unless the
+// user turns it on, so nothing reaches GitHub by default.
+const CONFIG_FILE = path.join(RUNS, '.config.json');
+// baseline: each open PR's head commit when auto-test was switched on. Only a
+// PR whose head moves past it (a new PR or a new push) is tested on its own;
+// the backlog that was already open is tested only when someone asks.
+// connections: how each engine is reached, plan | api | off (lib/connections.mjs).
+const DEFAULTS = { autoTest: true, model: MODELS[0].id, post: false, slack: false, commands: true, baseline: null, repos: null, connections: conn.DEFAULT_MODES, effort: 'default', credit: '', rules: [], ruleDefault: 'test', fix: { on: false, authors: [], model: 'same', effort: 'same' } };
+const getConfig = () => { const c = { ...DEFAULTS, ...(readJson(CONFIG_FILE) ?? {}) }; c.connections = { ...conn.DEFAULT_MODES, ...c.connections }; c.fix = { ...DEFAULTS.fix, ...c.fix }; return c; };
+// Models of engines that are not turned off.
+// "Auto": the model and effort are picked per pull request after triage
+// (lib/autopick.mjs), on the engine that is connected (Claude first).
+const AUTO = { id: 'auto', engine: 'auto', label: 'Auto', note: 'Picked per pull request: the fast model for a small one, the strongest for a large or risky one.' };
+const isModel = (id) => id === 'auto' || MODELS.some((m) => m.id === id);
+const offered = () => { const on = getConfig().connections; return [AUTO, ...MODELS.filter((m) => on[m.engine] !== 'off')]; };
+let lastReady = null; // engines last seen connected, from conn.statusAll
+function autoEngine() {
+  const on = getConfig().connections;
+  const ok = (e) => on[e] !== 'off' && (!lastReady || lastReady.has(e));
+  return ok('claude') ? 'claude' : ok('codex') ? 'codex' : null;
+}
+const runEngine = (model) => (model === 'auto' ? autoEngine() : engineOf(model));
+const refreshReady = () => conn.statusAll(getConfig().connections).then((all) => { lastReady = new Set(all.filter((c) => c.ready).map((c) => c.engine)); }).catch(() => {});
+setTimeout(refreshReady, 3000);
+setInterval(refreshReady, 5 * 60 * 1000);
+const snapshotHeads = async () => Object.fromEntries((await refreshPrs()).list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
+async function setConfig(patch) {
+  const next = { ...getConfig() };
+  if (typeof patch.autoTest === 'boolean') {
+    if (patch.autoTest && !next.autoTest) next.baseline = await snapshotHeads();
+    next.autoTest = patch.autoTest;
+  }
+  for (const k of ['post', 'slack', 'commands']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
+  // Turn one repo on or off; only repos with a test profile can be on.
+  if (gh.validRepo(patch.repo) && typeof patch.on === 'boolean' && profiled().has(patch.repo)) {
+    const cur = new Set(Array.isArray(next.repos) ? next.repos : [...profiled().keys()]);
+    if (patch.on) cur.add(patch.repo); else cur.delete(patch.repo);
+    next.repos = [...cur];
+  }
+  if (isModel(patch.model)) next.model = patch.model;
+  // Fixes: on or off, and whose pull requests (GitHub logins).
+  if (patch.fix && typeof patch.fix === 'object') {
+    const f = { ...next.fix };
+    if (typeof patch.fix.on === 'boolean') f.on = patch.fix.on;
+    // The model a fix runs on: the testing model ("same"), or one of its own.
+    if (patch.fix.model === 'same' || MODELS.some((m) => m.id === patch.fix.model)) f.model = patch.fix.model;
+    if (patch.fix.effort === 'same' || EFFORTS.some((x) => x.id === patch.fix.effort && x.id !== 'auto')) f.effort = patch.fix.effort;
+    if (Array.isArray(patch.fix.authors)) {
+      const logins = patch.fix.authors.map((a) => String(a).trim().replace(/^@/, '')).filter(Boolean);
+      const bad = logins.find((l) => !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(l));
+      if (bad) throw new Error(`${bad.slice(0, 40)} is not a GitHub username.`);
+      f.authors = [...new Set(logins)].slice(0, 50);
+    }
+    next.fix = f;
+  }
+  if (patch.rules !== undefined) next.rules = prRules.cleanRules(patch.rules);
+  if (['test', 'skip'].includes(patch.ruleDefault)) next.ruleDefault = patch.ruleDefault;
+  if (EFFORTS.some((x) => x.id === patch.effort)) next.effort = patch.effort;
+  // The person credited with Miu on every report (a GitHub login, or empty).
+  if (typeof patch.credit === 'string') {
+    const login = patch.credit.trim().replace(/^@/, '');
+    if (login && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(login)) throw new Error('That is not a GitHub username.');
+    next.credit = login;
+  }
+  if (ENGINES[patch.engine] && conn.MODES.includes(patch.mode)) {
+    next.connections = { ...next.connections, [patch.engine]: patch.mode };
+    // Turning off the engine of the chosen model moves new runs to a model that is still on.
+    if (patch.mode === 'off' && engineOf(next.model) === patch.engine) next.model = MODELS.find((m) => next.connections[m.engine] !== 'off')?.id ?? next.model;
+  }
+  fs.mkdirSync(RUNS, { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2));
+  return next;
+}
+
+// Open pull requests in the three repos, cached for a minute.
+let prCache = { at: 0, list: [], error: null };
+// The list is served from the cache at once and refreshed in the background
+// (stale-while-revalidate), so a slow GitHub never holds up a page.
+let prRefresh = null;
+function fetchPrs(force) {
+  if (force || Date.now() - prCache.at > 60 * 1000) refreshPrs();
+  return prCache;
+}
+function refreshPrs() {
+  prRefresh ??= (async () => {
+    const list = [];
+    let error = null;
+    for (const repo of repos()) {
+      try { for (const p of await gh.openPrs(repo)) list.push({ repo, ...p, labels: (p.labels ?? []).map((l) => l.name) }); }
+      catch (e) { error = `Could not list pull requests in ${repo}: ${e.message.split('\n')[0]}`; }
+    }
+    // Keep the last good list when GitHub fails outright.
+    prCache = list.length || !prCache.list.length ? { at: Date.now(), list, error } : { ...prCache, error };
+    refreshSignals(prCache.list);
+    return prCache;
+  })().finally(() => { prRefresh = null; });
+  return prRefresh;
+}
+
+// QA signals from GitHub (who reported, commits since, who is testing), filled
+// in the background; the list shows at once and gains them a moment later.
+let signals = new Map(), signalsBusy = false;
+function refreshSignals(list) {
+  if (signalsBusy) return;
+  signalsBusy = true;
+  qaSignals(list.map((p) => ({ repo: p.repo, number: p.number, updatedAt: p.updatedAt })))
+    .then((m) => { signals = m; }, (e) => console.error('qa signals:', e.message))
+    .finally(() => { signalsBusy = false; });
+}
+
+// Every run, keyed by repo#pr, newest first, with the commit it tested. A
+// paired run counts for every PR of the pair, each at the commit it tested;
+// pairOthers lists the rest of the pair, so a commit on any of them makes the
+// result old.
+function runsByPr() {
+  const map = new Map();
+  const add = (k, row) => { if (!map.has(k)) map.set(k, []); map.get(k).push(row); };
+  for (const r of listRuns()) {
+    const pr = readJson(path.join(RUNS, r.name, 'context/pr.json'));
+    if (!r.repo || !pr) continue;
+    const k = `${r.repo}#${r.number}`;
+    const posted = readJson(path.join(RUNS, r.name, 'posted.json'));
+    const pair = (readJson(path.join(RUNS, r.name, 'context/pair.json')) ?? []).map((x) => ({ key: `${x.repo}#${x.number}`, sha: x.headRefOid, label: `${x.label} #${x.number}` }));
+    const all = [{ key: k, sha: pr.headRefOid, label: `${roles()[roleOf(r.repo)]?.label ?? r.repo.split('/')[1]} #${r.number}` }, ...pair];
+    // Each PR of a pair has its own verdict.
+    const members = readJson(path.join(RUNS, r.name, 'verdict.json'))?.members ?? [];
+    for (const m of all) {
+      add(m.key, { ...r, verdict: members.find((x) => x.key === m.key)?.verdict ?? r.verdict, sha: m.sha, via: m.key === k ? null : k, pairOthers: all.filter((x) => x.key !== m.key), postedAt: posted?.members ? (posted.members.find((x) => x.key === m.key)?.url ? posted.at : null) : (m.key === k ? posted?.at ?? null : null) });
+    }
+  }
+  return map;
+}
+// The PRs of a run's pair whose head moved since it tested them.
+const pairMoved = (run, heads) => (run?.pairOthers ?? []).filter((o) => heads.has(o.key) && heads.get(o.key) !== o.sha);
+
+// The queue survives a restart of this server.
+const QUEUE_FILE = path.join(RUNS, '.queue.json');
+const queue = readJson(QUEUE_FILE) ?? [];
+const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2)); } catch { /* runs dir missing */ } };
+// Why automatic testing leaves a PR alone, or null: a draft, qa:skip, or the
+// rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.
+const skipReason = (p) => {
+  if (p.isDraft) return 'Draft';
+  if (p.labels.includes('Miu Skip')) return 'Labelled Miu Skip';
+  if (p.labels.includes('qa:skip')) return 'Labelled qa:skip';
+  const cfg = getConfig();
+  const d = prRules.decide(cfg.rules ?? [], cfg.ruleDefault ?? 'test', p);
+  if (d.action !== 'skip') return null;
+  return d.rule ? `Rule ${d.index + 1}: ${prRules.describe(d.rule)}` : 'No rule says to test it';
+};
+
+function prView() {
+  const { list, error, at } = fetchPrs();
+  const runs = runsByPr();
+  const live = liveRun();
+  const fixes = listFixes();
+  const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
+  return {
+    // How many open PRs each rule matches now, for the Settings page.
+    ruleHits: (getConfig().rules ?? []).map((r) => list.filter((p) => prRules.matches(r, p)).length),
+    error, fetchedAt: at, config: (({ baseline, ...c }) => c)(getConfig()), queue: queue.map((q) => `${q.repo}#${q.pr}`), queueHeld, disk: diskState(), queueFull: queue.filter((q) => q.full).map((q) => `${q.repo}#${q.pr}`),
+    prs: list.map((p) => {
+      const all = runs.get(`${p.repo}#${p.number}`) ?? [];
+      const atHead = all.find((r) => r.sha === p.headRefOid);
+      const latest = all[0] ?? null;
+      // Miu's own runs first, then the team on GitHub. The newest QA signal
+      // wins: a person's report comment, or a "Tested & …" label a person
+      // added (a label Miu put on when it posted does not count as a person).
+      // No commits after that signal: tested by that person. Commits after,
+      // or "Needs Re-Test": it needs testing again. "Test Ongoing" without a
+      // Miu run: a person is testing it now.
+      const qa = signals.get(`${p.repo}#${p.number}`) ?? null;
+      // "Test Ongoing" that Miu itself put on, with no run of it going, is a
+      // leftover (a crashed run), not a person testing.
+      const personTesting = p.labels.includes('Test Ongoing') && atHead?.state !== 'running' && !/miu/i.test(qa?.ongoingBy ?? '');
+      const miuLabel = (r) => !!r && all.some((x) => x.postedAt && Math.abs(Date.parse(x.postedAt) - Date.parse(r.at)) < 5 * 60 * 1000);
+      const personLabel = qa?.labelReport && !miuLabel(qa.labelReport) ? qa.labelReport : null;
+      const signalsBy = [qa?.lastPerson && { ...qa.lastPerson, stale: qa.newCommitsSincePerson }, personLabel && { ...personLabel, stale: qa.newCommitsSinceLabel }].filter(Boolean);
+      const lastSignal = signalsBy.sort((x, y) => Date.parse(x.at) - Date.parse(y.at)).at(-1) ?? null;
+      const needsRetestLabel = p.labels.includes('Needs Re-Test') && !(lastSignal && !lastSignal.stale && lastSignal.kind === 'label');
+      let state = 'untested', why = null;
+      if (skipReason(p)) state = 'skipped';
+      // A paired run is one test: the PR whose run it is shows it running; the
+      // pair's other PRs say whose test they are in.
+      else if (atHead?.state === 'running' && atHead.via) { state = 'in_pair'; why = (atHead.pairOthers ?? []).find((o) => o.key === atHead.via)?.label ?? atHead.via; }
+      else if (atHead?.state === 'running') state = 'running';
+      else if (queue.some((q) => q.repo === p.repo && q.pr === p.number)) state = 'queued';
+      else if (personTesting) { state = 'person_testing'; why = qa?.ongoingBy ? `${qa.ongoingBy} is testing it` : 'Test Ongoing'; }
+      // The newest run did not start testing: say what it waits for, and the
+      // last result this commit got, if any.
+      else if (atHead?.state === 'waiting') {
+        state = 'waiting';
+        const r = atHead.waiting?.reasons?.[0] ?? '';
+        const build = r.match(/^Could not prepare ([\w-]+)/)?.[1];
+        const pkg = r.match(/requires ([\w-]+\/[\w.-]+)/i)?.[1];
+        why = build ? `${build} build failed${pkg ? `: needs ${pkg}` : ''}` : r.slice(0, 90);
+        const before = all.find((x) => x.sha === p.headRefOid && x.state === 'done' && x.verdict);
+        if (before) why += `. Last result: ${VERDICT_WORDS[before.verdict] ?? before.verdict}`;
+      }
+      else if (atHead && atHead.state === 'done' && pairMoved(atHead, heads).length) { state = 'retest'; why = `${pairMoved(atHead, heads).map((o) => o.label).join(' and ')} changed since the paired test`; }
+      else if (atHead && atHead.state === 'done') state = 'tested';
+      else if (atHead && atHead.state === 'conflict') state = 'conflict';
+      else if (lastSignal && !lastSignal.stale && !needsRetestLabel) { state = 'tested_by_person'; why = `${lastSignal.by}: ${lastSignal.kind === 'label' ? lastSignal.label : lastSignal.verdict}`; }
+      else if (needsRetestLabel || (lastSignal && lastSignal.stale) || (qa?.last && qa.newCommitsSince)) {
+        state = 'retest';
+        const src = lastSignal ?? (qa?.last ? { by: qa.last.kind === 'miu' ? 'Miu' : qa.last.by, kind: 'comment', verdict: qa.last.verdict } : null);
+        why = needsRetestLabel && !(lastSignal?.stale) ? 'Needs Re-Test' : src ? `new commits since ${src.by}'s ${src.kind === 'label' ? `"${src.label}"` : `report (${src.verdict})`}` : 'Needs Re-Test';
+      }
+      else if (latest) state = 'stale';
+      return {
+        repo: p.repo, number: p.number, title: p.title, author: p.author?.login, sha: p.headRefOid, branch: p.headRefName, url: p.url,
+        updatedAt: p.updatedAt, createdAt: p.createdAt, labels: p.labels, isDraft: p.isDraft, skip: skipReason(p), state,
+        backlog: getConfig().baseline?.[`${p.repo}#${p.number}`] === p.headRefOid,
+        run: atHead ?? latest, runs: all.length, live: live && atHead?.name === live,
+        fix: fixes.find((f) => f.repo === p.repo && f.pr === p.number) ?? null,
+        why, pair: ((atHead ?? latest)?.pairOthers ?? []).map((o) => o.label),
+        qa: qa && { last: qa.last, lastPerson: lastSignal ?? qa.lastPerson, newCommitsSince: qa.newCommitsSince, ongoingBy: p.labels.includes('Test Ongoing') ? qa.ongoingBy : null },
+      };
+    }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+  };
+}
+
+// full: test every claim again instead of only what changed since the last
+// round. note: what a reviewer asked for in a /miu comment.
+function enqueue(repo, pr, why, { full = false, note = '', force = false } = {}) {
+  const have = queue.find((q) => q.repo === repo && q.pr === pr);
+  if (have) { if (full) have.full = true; if (force) have.force = true; if (note) have.note = note; saveQueue(); return { ok: true, queued: true }; }
+  queue.push({ repo, pr, why, full, force, note, at: Date.now() });
+  saveQueue();
+  pump();
+  return { ok: true, queued: true };
+}
+
+// Queue a PR unless another PR of its pair is already queued or running: one
+// paired run tests them all.
+async function enqueuePair(repo, pr, why) {
+  let keys = [];
+  try { keys = Object.values(await partnersOf(repo, pr)).map((x) => `${x.repo}#${x.number}`); } catch (e) { console.error('pair lookup:', e.message); }
+  const live = liveRun();
+  const dir = live && path.join(RUNS, live);
+  const own = dir && readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+  const liveKeys = dir ? [own && `${own[1]}#${own[2]}`, ...(readJson(path.join(dir, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`)].filter(Boolean) : [];
+  if (keys.some((k) => queue.some((q) => `${q.repo}#${q.pr}` === k) || liveKeys.includes(k))) return { ok: true, queued: false, pairedWith: keys };
+  return enqueue(repo, pr, why);
+}
+
+// Start the next queued run when nothing is running.
+// A queued run waits, rather than failing on its first turn, while the
+// model's engine is not signed in (lib/connections.mjs); queueHeld says why.
+let queueHeld = null;
+let pumping = false;
+async function pump() {
+  if (!queue.length || liveRun() || pumping) return;
+  pumping = true;
+  try {
+    const cfg = getConfig();
+    const all = await conn.statusAll(cfg.connections);
+    lastReady = new Set(all.filter((c) => c.ready).map((c) => c.engine));
+    const engine = runEngine(cfg.model) ?? 'codex';
+    const st = all.find((c) => c.engine === engine);
+    if (st && !st.ready) {
+      const why = `${ENGINES[engine].label} is not connected: ${st.problem || 'sign in under Settings'}`;
+      if (queueHeld !== why) console.error(`queue held: ${why}`);
+      queueHeld = why;
+      return;
+    }
+    // Signed in, but the service turned the sign-in away in a run: hold until it changes.
+    const refused = refusal(RUNS, engine, cfg.connections?.[engine] ?? conn.DEFAULT_MODES?.[engine]);
+    if (refused) {
+      const why = `${ENGINES[engine].label} refused Miu's sign-in at ${new Date(refused.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} (${refused.message}). Sign in again under Settings`;
+      if (queueHeld !== why) console.error(`queue held: ${why}`);
+      queueHeld = why;
+      return;
+    }
+    queueHeld = null;
+  } catch (e) { console.error('queue check:', e.message); } finally { pumping = false; }
+  if (!queue.length || liveRun()) return;
+  const next = queue.shift();
+  saveQueue();
+  const cfg = getConfig();
+  const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
+  if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
+}
+
+// New pull requests and new commits get queued while auto-test is on.
+async function autoScan() {
+  let cfg = getConfig();
+  if (cfg.autoTest && !cfg.baseline) {
+    // First start: remember today's heads instead of testing the whole backlog.
+    fs.mkdirSync(RUNS, { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...cfg, baseline: await snapshotHeads() }, null, 2));
+    cfg = getConfig();
+  }
+  if (cfg.autoTest) {
+    const { list } = await refreshPrs();
+    const runs = runsByPr();
+    const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
+    for (const p of list) {
+      // "Ready For Testing" or "Needs Re-Test" on a PR is a request, like
+      // /miu retest: taken whatever was tested before or open before
+      // auto-test. Miu takes the label off when it starts, so it being back
+      // asks again. A draft or Miu Skip still wins; a run of this PR in the
+      // last 30 minutes means the label did not come off, so no loop.
+      if (p.isDraft || p.labels.includes('Miu Skip') || p.labels.includes('qa:skip')) continue;
+      if (p.labels.some((l) => l === 'Ready For Testing' || l === 'Needs Re-Test')) {
+        const recent = (runs.get(`${p.repo}#${p.number}`) ?? []).some((r) => Date.now() - (Date.parse(r.startedAt ?? 0) || r.mtime) < 30 * 60 * 1000);
+        const busy = queue.some((q) => q.repo === p.repo && q.pr === p.number) || liveRun()?.startsWith(`${p.repo.split('/')[1]}-${p.number}-`);
+        // The label comes back when a run ends with no result. Two of those on
+        // this commit is enough: a new commit, or a person, asks again.
+        const empty = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((r) => r.sha === p.headRefOid && ['no_result', 'inconclusive'].includes(r.verdict)).length;
+        if (empty >= 2) continue;
+        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => l === 'Ready For Testing' || l === 'Needs Re-Test')}`);
+        continue;
+      }
+      if (skipReason(p)) continue;
+      if (cfg.baseline[`${p.repo}#${p.number}`] === p.headRefOid) continue;
+      // A person is on it, or already tested this commit: do not test twice.
+      const qa = signals.get(`${p.repo}#${p.number}`);
+      if (p.labels.includes('Test Ongoing') && !liveRun()?.startsWith(`${p.repo.split('/')[1]}-${p.number}-`)) continue;
+      if (qa?.lastPerson && !qa.newCommitsSincePerson) continue;
+      if (qa?.labelReport && !qa.newCommitsSinceLabel) continue;
+      // A run stopped by a person does not count as tested. One that died on
+      // its own (crash) gets one more try, not a new run every scan.
+      const forSha = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((r) => r.sha === p.headRefOid);
+      const crashed = forSha.filter((r) => r.state === 'stopped' && r.crashed);
+      // A run with no claims gets one more try. A waiting run is tried again
+      // an hour later, in case what it waited for (a build, a sign-in) is fixed.
+      const empty = forSha.filter((r) => ['no_result', 'inconclusive'].includes(r.verdict));
+      const waitedLong = (r) => r.state === 'waiting' && Date.now() - Date.parse(r.waiting?.at ?? 0) > 60 * 60 * 1000;
+      const mine = forSha.filter((r) => (r.state !== 'stopped' || (r.crashed && crashed.length >= 2))
+        && !(empty.includes(r) && empty.length < 2) && !waitedLong(r));
+      const tested = mine.some((r) => r.state === 'running' || !pairMoved(r, heads).length);
+      if (!tested) await enqueuePair(p.repo, p.number, mine.length ? 'a paired PR changed' : 'new commits');
+    }
+  }
+  pump();
+}
+setInterval(() => scanCommands().catch((e) => console.error('commands:', e.message)), 2 * 60 * 1000);
+setTimeout(() => scanCommands().catch((e) => console.error('commands:', e.message)), 8000);
+const scan = () => autoScan().catch((e) => console.error('auto scan:', e.message));
+setInterval(scan, 2 * 60 * 1000);
+setTimeout(scan, 5000);
+setInterval(pump, 15 * 1000);
+
+// ---- disk: what a finished run keeps -------------------------------------
+// The agent's own working folders (its builds, node_modules, browsers) are
+// most of a run's size and nothing cites them, so they go once the run ends.
+// The report, verdict, results and evidence stay for good. The transcript and
+// the raw Codex events go after TRANSCRIPT_DAYS; their numbers stay in
+// usage.json, so stats keep the run.
+const WORK_DIRS = ['scratch', 'tmp', 'work', 'src', 'builds', 'stage'];
+const TRANSCRIPT_DAYS = Number(process.env.MIU_TRANSCRIPT_DAYS || 30);
+const SHOT_DAYS = Number(process.env.MIU_SHOT_DAYS || 7);
+// Cloudinary keeps a closed pull request's screenshots for CLOSED_DAYS, then
+// they go: its comment loses the images, which matters little once closed.
+const CLOSED_DAYS = Number(process.env.MIU_CLOSED_SHOT_DAYS || 30);
+let shotsUsageCache = null;
+async function shotsUsage() {
+  if (shotsUsageCache && Date.now() - shotsUsageCache.at < 10 * 60 * 1000) return shotsUsageCache.value;
+  const value = await cloud.usage().catch((e) => ({ error: e.message }));
+  shotsUsageCache = { at: Date.now(), value };
+  return value;
+}
+// <folder>/<repo>-<pr>-...: the longer repo name first ("plugin-pro" starts with "plugin").
+const esRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const shotId = () => new RegExp(`^${esRe(project().cloudinary_folder)}/(${profiles().map((p) => esRe(p.repo.split('/')[1])).sort((a, b) => b.length - a.length).join('|') || '(?!)'})-(\\d+)-`);
+async function cleanCloudinary() {
+  if (!cloudinaryUrl() || !prCache.list.length) return;
+  const open = new Set(prCache.list.map((p) => `${p.repo.split('/')[1]}-${p.number}`));
+  const old = (await cloud.listShots()).filter((s) => {
+    const m = s.public_id.match(shotId());
+    return m && !open.has(`${m[1]}-${m[2]}`) && Date.now() - Date.parse(s.created_at) > CLOSED_DAYS * 86400000;
+  });
+  if (old.length) console.log(`cloudinary: removed ${await cloud.deleteShots(old.map((s) => s.public_id))} screenshots of pull requests closed over ${CLOSED_DAYS} days ago`);
+}
+setTimeout(() => cleanCloudinary().catch((e) => console.error('cloudinary clean-up:', e.message)), 5 * 60 * 1000);
+setInterval(() => cleanCloudinary().catch((e) => console.error('cloudinary clean-up:', e.message)), 24 * 3600 * 1000);
+// Only a recent crash, and only the newest run of its PR: putting back the
+// labels of an older run would undo what a later run or a person set since.
+function sweepCrashed() {
+  const runs = listRuns();
+  for (const r of runs) {
+    if (r.state !== 'stopped' || !r.crashed) continue;
+    const dir = path.join(RUNS, r.name);
+    if (fs.existsSync(path.join(dir, 'cleanup.json'))) continue;
+    const newer = runs.some((x) => x.repo === r.repo && x.number === r.number && x.mtime > r.mtime && x.name !== r.name);
+    const old = Date.now() - Date.parse(r.startedAt ?? 0) > 12 * 3600 * 1000;
+    if (newer || old) { try { fs.writeFileSync(path.join(dir, 'cleanup.json'), JSON.stringify({ at: new Date().toISOString(), why: newer ? 'a newer run of this pull request exists' : 'older than 12 hours', skipped: true })); } catch { /* disk full */ } continue; }
+    cleanupRun(dir, 'the run ended without finishing; cleaned up after it');
+  }
+}
+setInterval(() => { try { sweepCrashed(); } catch (e) { console.error('crash sweep:', e.message); } }, 5 * 60 * 1000);
+setTimeout(() => { try { sweepCrashed(); } catch (e) { console.error('crash sweep:', e.message); } }, 30 * 1000);
+
+function pruneRuns() {
+  let freed = 0;
+  const size = (p) => { try { return Number(spawnSync('du', ['-sk', p], { encoding: 'utf8' }).stdout.split('\t')[0]) * 1024 || 0; } catch { return 0; } };
+  for (const r of listRuns()) {
+    if (r.state === 'running') continue;
+    const dir = path.join(RUNS, r.name);
+    for (const d of WORK_DIRS) {
+      const p = path.join(dir, d);
+      if (!fs.existsSync(p)) continue;
+      freed += size(p);
+      rmAny(p);
+    }
+    // A screenshot already on Cloudinary leaves this disk after SHOT_DAYS;
+    // /evidence/ then redirects to the uploaded copy.
+    const up = readJson(path.join(dir, 'screenshots.json')) ?? {};
+    for (const [file, url] of Object.entries(up)) {
+      const p = path.join(dir, 'evidence', file);
+      try { if (typeof url === 'string' && url.startsWith('https://') && Date.now() - fs.statSync(p).mtimeMs > SHOT_DAYS * 86400000) { freed += fs.statSync(p).size; fs.rmSync(p); } } catch { /* already gone */ }
+    }
+    const t = path.join(dir, 'agent-transcript.jsonl');
+    let age; try { age = Date.now() - fs.statSync(t).mtimeMs; } catch { continue; }
+    if (age < TRANSCRIPT_DAYS * 86400000) continue;
+    const u = readUsage(dir);
+    if (u) fs.writeFileSync(path.join(dir, 'usage.json'), JSON.stringify(u));
+    for (const f of ['agent-transcript.jsonl', 'agent-codex.jsonl']) { const fp = path.join(dir, f); if (fs.existsSync(fp)) { freed += fs.statSync(fp).size; fs.rmSync(fp); } }
+    usageCache.delete(dir);
+  }
+  if (freed > 1e6) console.log(`pruned finished runs: ${(freed / 1e9).toFixed(2)} GB freed`);
+}
+setTimeout(() => { try { pruneRuns(); } catch (e) { console.error('prune:', e.message); } }, 20 * 1000);
+setInterval(() => { try { pruneRuns(); } catch (e) { console.error('prune:', e.message); } }, 6 * 3600 * 1000);
+
+function startRun({ repo, pr, model, dryRun, full, force, note, slack }) {
+  if (!repos().includes(repo)) return { error: 'Unknown repo' };
+  if (!Number.isInteger(pr) || pr < 1) return { error: 'The PR number must be a whole number' };
+  if (!isModel(model)) return { error: 'Unknown model' };
+  const engine = runEngine(model);
+  if (!engine) return { error: 'No AI engine is connected under AI connections' };
+  const mode = getConfig().connections[engine];
+  if (mode === 'off') return { error: `${ENGINES[engine].label} is turned off under AI connections` };
+  const busy = liveRun();
+  if (busy) return { error: `Run ${busy} is still going. One run at a time.` };
+  const name = `${repo.split('/')[1]}-${pr}-${model.replace('claude-', '')}-${new Date().toISOString().slice(5, 19).replace(/[-:T]/g, '')}`;
+  const dir = path.join(RUNS, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const out = fs.openSync(path.join(dir, 'qa-run.out'), 'a');
+  const args = [path.join(ROOT, 'bin/qa-run'), '--repo', repo, '--pr', String(pr), '--model', model === 'auto' ? `auto:${engine}` : model, '--auth', mode, '--run-dir', dir];
+  const effort = getConfig().effort;
+  if (effort && effort !== 'default') args.push('--effort', effort);
+  if (dryRun) args.push('--dry-run');
+  if (full) args.push('--full');
+  if (force) args.push('--force');
+  if (note) args.push('--note', String(note).slice(0, 500));
+  if (slack) args.push('--slack');
+  const child = spawn(process.execPath, args, { cwd: ROOT, detached: true, stdio: ['ignore', out, out] });
+  child.on('error', (e) => console.error('could not start qa-run:', e.message));
+  child.unref();
+  return { name };
+}
+
+// ---- fixes ----------------------------------------------------------------
+// A fix (bin/qa-fix) runs beside the tests, in its own worktree, one at a
+// time: runs/.fixes/<name>/ holds its log, the agent's work and result.json.
+// With Fixes on, a finished run that found problems in a pull request by one
+// of the chosen authors gets fixed on its own; the Fix button asks for any.
+const FIXES = path.join(RUNS, '.fixes');
+function fixAlive(dir) {
+  const m = readJson(path.join(dir, 'qa-fix.json'));
+  if (!m?.pid || !alive(m.pid)) return false;
+  let cmd = '';
+  try { cmd = fs.readFileSync(`/proc/${m.pid}/cmdline`, 'utf8'); } catch { cmd = spawnSync('ps', ['-o', 'args=', '-p', String(m.pid)], { encoding: 'utf8' }).stdout || ''; }
+  return cmd.includes('qa-fix') && cmd.includes(path.basename(dir));
+}
+// Newest first.
+function listFixes() {
+  if (!fs.existsSync(FIXES)) return [];
+  return fs.readdirSync(FIXES, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => {
+    const dir = path.join(FIXES, d.name);
+    const meta = readJson(path.join(dir, 'qa-fix.json'));
+    if (!meta) return null;
+    const result = readJson(path.join(dir, 'result.json'));
+    const going = !result && fixAlive(dir);
+    const last = (read(path.join(dir, 'run.log')) ?? '').trim().split('\n').map((l) => l.replace(/^\[fix [\d:]+\] /, '')).filter((l) => !/^refused /.test(l)).pop() ?? '';
+    return {
+      name: d.name, repo: meta.repo, pr: meta.pr, sha: meta.sha, run: meta.run, model: meta.model, by: meta.by ?? null, started: meta.started,
+      state: result?.state ?? (going ? 'running' : 'stopped'), last: going ? last : null,
+      replay: readJson(path.join(dir, 'replay.json')) ?? [],
+      ...(result ? { at: result.at, reason: result.reason ?? null, fixed: result.fixed ?? [], left: result.left ?? [], pushed: result.pushed ?? null, as: result.as ?? null, branch: result.branch ?? null, comment: result.comment ?? null, changed: result.changed ?? null } : {}),
+    };
+  }).filter(Boolean).sort((a, b) => Date.parse(b.started) - Date.parse(a.started));
+}
+const liveFix = () => listFixes().find((f) => f.state === 'running') ?? null;
+
+function startFix({ run, by = null }) {
+  const runDir = path.join(RUNS, run);
+  const v = readJson(path.join(runDir, 'verdict.json'));
+  if (!v || runAlive(runDir)) return { error: 'That run has not finished' };
+  if (!fixLib.FIXABLE_VERDICTS.includes(v.verdict)) return { error: 'That run found nothing to fix' };
+  const busy = liveFix();
+  if (busy) return { error: `Miu is fixing ${busy.repo.split('/')[1]} #${busy.pr}. One fix at a time.` };
+  if (listFixes().some((f) => f.run === run && ['running', 'pushed'].includes(f.state))) return { error: 'Miu already fixed what this run found' };
+  const cfg = getConfig();
+  // Its own model under Fixes, or the testing one; Auto takes the engine's strongest.
+  const want = cfg.fix.model && cfg.fix.model !== 'same' ? cfg.fix.model : cfg.model;
+  const engine = runEngine(want);
+  if (!engine) return { error: 'No AI engine is connected under AI & agents' };
+  if (cfg.connections[engine] === 'off') return { error: `${ENGINES[engine].label} is turned off under AI & agents` };
+  if (queueHeld && engine === runEngine(cfg.model)) return { error: queueHeld };
+  if (lastReady && !lastReady.has(engine)) return { error: `${ENGINES[engine].label} is not connected: sign in under Settings, AI & agents` };
+  if (refusal(RUNS, engine, cfg.connections[engine])) return { error: `${ENGINES[engine].label} refused Miu's sign-in; sign in again under Settings, AI & agents` };
+  const model = want === 'auto' ? MODELS.find((m) => m.engine === engine)?.id : want;
+  const meta = readJson(path.join(runDir, 'context/pr.json'));
+  const name = `${meta.url.split('/')[4]}-${meta.number}-${String(meta.headRefOid).slice(0, 7)}-${new Date().toISOString().slice(5, 19).replace(/[-:T]/g, '')}`;
+  const dir = path.join(FIXES, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const out = fs.openSync(path.join(dir, 'qa-fix.out'), 'a');
+  const args = [path.join(ROOT, 'bin/qa-fix'), '--run', runDir, '--fix-dir', dir, '--model', model, '--auth', cfg.connections[engine]];
+  // Its own effort under Fixes, or the testing one. Auto sizes a test by the pull
+  // request; a fix has no such measure, so it runs at the engine's default.
+  const effort = cfg.fix.effort && cfg.fix.effort !== 'same' ? cfg.fix.effort : cfg.effort;
+  if (effort && !['default', 'auto'].includes(effort)) args.push('--effort', effort);
+  // Comments follow Post to GitHub, as test reports do; the commit itself is the fix.
+  if (cfg.post) args.push('--comment');
+  if (by) args.push('--by', String(by).slice(0, 60));
+  const child = spawn(process.execPath, args, { cwd: ROOT, detached: true, stdio: ['ignore', out, out] });
+  child.on('error', (e) => console.error('could not start qa-fix:', e.message));
+  child.unref();
+  console.log(`fix ${name}: started for ${run}${by ? ` by ${by}` : ''}`);
+  return { ok: true, name };
+}
+
+function stopFix(name) {
+  const dir = path.join(FIXES, name);
+  const m = readJson(path.join(dir, 'qa-fix.json'));
+  if (!m || !fixAlive(dir)) return { error: 'That fix is not going' };
+  try { process.kill(-m.pid, 'SIGTERM'); } catch { try { process.kill(m.pid, 'SIGTERM'); } catch { /* gone */ } }
+  fs.writeFileSync(path.join(dir, 'result.json'), JSON.stringify({ state: 'stopped', at: new Date().toISOString(), reason: 'stopped from the dashboard' }));
+  return { ok: true };
+}
+
+// Miu commits on the branch tip, counted back from the head: each pushed fix
+// whose commit is the head (or the commit the next one fixed).
+function autoRounds(p, fixes) {
+  let n = 0, head = p.headRefOid;
+  for (;;) {
+    const f = fixes.find((x) => x.repo === p.repo && x.pr === p.number && x.state === 'pushed' && x.pushed === head);
+    if (!f) return n;
+    n++; head = f.sha;
+  }
+}
+
+// With Fixes on: the newest finished run at a PR's head that found something,
+// for a PR by one of the chosen authors, not fixed yet, and fewer than
+// AUTO_ROUNDS Miu fixes on top of the author's own last commit.
+async function fixScan() {
+  const cfg = getConfig();
+  const fixes = listFixes();
+  // A pushed fix is a new commit to test, even with auto-test off.
+  for (const f of fixes.filter((x) => x.state === 'pushed' && Date.now() - Date.parse(x.at) < 3600 * 1000)) {
+    const mark = path.join(FIXES, f.name, 'queued');
+    if (fs.existsSync(mark)) continue;
+    fs.writeFileSync(mark, new Date().toISOString());
+    await enqueuePair(f.repo, f.pr, 'Miu pushed a fix');
+  }
+  if (!cfg.fix.on || !cfg.fix.authors.length || liveFix()) return;
+  const authors = new Set(cfg.fix.authors.map((a) => a.toLowerCase()));
+  const runs = runsByPr();
+  for (const p of fetchPrs().list) {
+    if (!authors.has(String(p.author?.login ?? '').toLowerCase()) || p.isDraft || p.labels.includes('Miu Skip')) continue;
+    // The PR's own run (a paired run is fixed through each PR's own), newest first.
+    const r = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((x) => !x.via && x.sha === p.headRefOid && x.state === 'done')
+      .sort((a, b) => (Date.parse(b.startedAt ?? 0) || b.mtime) - (Date.parse(a.startedAt ?? 0) || a.mtime))[0];
+    if (!r || !fixLib.FIXABLE_VERDICTS.includes(r.verdict)) continue;
+    // A fix that failed (a sign-in, the machine) gets one more try; any other outcome stands.
+    const tried = fixes.filter((f) => f.run === r.name);
+    if (tried.some((f) => !['failed', 'stopped'].includes(f.state)) || tried.length >= 2) continue;
+    if (autoRounds(p, fixes) >= fixLib.AUTO_ROUNDS) continue;
+    const s = startFix({ run: r.name, by: 'auto' });
+    if (s.error) console.error(`fix ${p.repo}#${p.number}: ${s.error}`);
+    return;
+  }
+}
+setInterval(() => fixScan().catch((e) => console.error('fix scan:', e.message)), 60 * 1000);
+
+function switchModel(name, model) {
+  const dir = path.join(RUNS, name);
+  if (!MODELS.some((m) => m.id === model)) return { error: 'Unknown model' };
+  if (!isLive(dir)) return { error: 'That run is not going' };
+  const now = lines(path.join(dir, 'models.jsonl')).at(-1)?.model;
+  if (!ENGINES[engineOf(now)]?.switchable || engineOf(now) !== engineOf(model)) return { error: `A ${ENGINES[engineOf(now)].label} run cannot change to ${model}` };
+  const seq = (readJson(path.join(dir, 'control.json'))?.seq ?? 0) + 1;
+  // lib/agent.mjs polls this file and calls Query.setModel within two seconds.
+  fs.writeFileSync(path.join(dir, 'control.json'), JSON.stringify({ seq, model }));
+  return { ok: true };
+}
+
+function steerRun(name, text, by) {
+  const dir = path.join(RUNS, name);
+  if (!isLive(dir)) return { error: 'That run is not going' };
+  const r = steer.add(dir, { by, text });
+  if (r.ok) console.log(`run ${name}: instruction from ${by}`);
+  return r;
+}
+
+function stopRun(name) {
+  const dir = path.join(RUNS, name);
+  const m = runMeta(dir);
+  if (!m || !alive(m.pid)) return { error: 'That run is not going' };
+  try { process.kill(-m.pid, 'SIGTERM'); } catch { try { process.kill(m.pid, 'SIGTERM'); } catch { /* gone */ } }
+  cleanupRun(dir, 'stopped from the dashboard');
+  return { ok: true };
+}
+
+// Values the rule editor suggests for each field: every label defined in the
+// tested repos (not only those on open PRs), and the authors, repos and
+// branches of the open pull requests. Labels are read at most every 10 minutes.
+let labelCache = { at: 0, list: [] };
+async function ruleSuggestions() {
+  if (Date.now() - labelCache.at > 10 * 60 * 1000) {
+    const all = new Set();
+    for (const r of repos()) { try { for (const l of await gh.restAll(`repos/${r}/labels`, { max: 300 })) all.add(l.name); } catch { /* keep the rest */ } }
+    if (all.size) labelCache = { at: Date.now(), list: [...all] };
+  }
+  const list = prCache.list;
+  const uniq = (xs) => [...new Set(xs.filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  return {
+    label: uniq([...labelCache.list, ...list.flatMap((p) => p.labels)]),
+    author: uniq(list.map((p) => p.author?.login ?? p.author)),
+    repo: uniq(repos().map((r) => r.split('/')[1])),
+    branch: uniq(list.map((p) => p.headRefName ?? p.branch)),
+    title: [],
+    draft: ['yes', 'no'],
+  };
+}
+
+// What qa-run's own clean-up would have done, for a run that did not get to
+// it: stopped from here, or crashed (a full disk, a killed process). Done once
+// per run (cleanup.json).
+function cleanupRun(dir, why) {
+  if (fs.existsSync(path.join(dir, 'cleanup.json'))) return;
+  try { fs.writeFileSync(path.join(dir, 'cleanup.json'), JSON.stringify({ at: new Date().toISOString(), why })); } catch { /* disk full: try anyway */ }
+  const m = runMeta(dir) ?? {};
+  // qa-run's own clean-up does not run when it is killed. Delete the scratch
+  // sites the agent made for this pull request (named qa<pr>...), and the Hub.
+  const pr = m.pr ?? readJson(path.join(dir, 'context/pr.json'))?.number;
+  if (pr) {
+    withRex(async (rex) => {
+      const listed = await rex.call('list_sites');
+      const sites = Array.isArray(listed) ? listed : (listed.sites ?? []);
+      for (const site of sites) {
+        if (new RegExp(`^qa${pr}[a-z0-9-]*\\.scratch\\.`).test(site.domain)) {
+          await rex.call('scratch_delete_site', { site_id: site.id }).then(() => fs.appendFileSync(path.join(dir, 'run.log'), `[qa ${new Date().toISOString().slice(11, 19)}] rexenv: deleted ${site.domain}\n`)).catch(() => {});
+        }
+      }
+    }).catch((e) => console.error('rexenv clean-up after stop:', e.message));
+  }
+  // A stopped run claims nothing: give the PR back the labels it had.
+  const before = readJson(path.join(dir, 'labels-before.json'));
+  // A paired run put "Test Ongoing" on every PR of the pair.
+  const back = before?.members ?? (before?.labels ? [before] : []);
+  if (back.length) {
+    import('../lib/publish.mjs').then(({ setLabels, LABELS }) => withAppToken(async () => {
+      for (const b of back) {
+        try { await setLabels(b.repo, b.pr, { add: b.labels.filter((l) => l !== LABELS.ongoing), remove: [LABELS.ongoing] }); fs.appendFileSync(path.join(dir, 'run.log'), `[qa ${new Date().toISOString().slice(11, 19)}] labels ${b.repo}#${b.pr}: put back ${b.labels.join(', ') || 'none'}\n`); } catch (e) { console.error('labels after stop:', e.message); }
+      }
+    }));
+  }
+  const hub = spawn(path.join(ROOT, 'env/hub/env.sh'), ['down'], { env: { ...process.env, QA_RUN_DIR: dir }, stdio: 'ignore', detached: true });
+  hub.on('error', () => {});
+  hub.unref();
+  try { fs.appendFileSync(path.join(dir, 'run.log'), `[qa ${new Date().toISOString().slice(11, 19)}] ${why}\n`); } catch { /* disk full */ }
+}
+
+// Evidence never changes once written, so the browser keeps it (private: it
+// sits behind sign-in).
+function sendFile(res, file) {
+  const type = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml' }[path.extname(file).toLowerCase()] ?? 'text/plain; charset=utf-8';
+  fs.createReadStream(file).on('error', () => { res.writeHead(404); res.end(); }).once('open', () => res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'private, max-age=604800, immutable' })).pipe(res);
+}
+
+// ---- /miu commands in pull request comments. A team member writes
+//   /miu retest            test what changed since the last round
+//   /miu retest full       test everything again
+//   /miu test <what>       the same, with a note on what to look at
+// Miu answers with an eyes reaction and queues the run. Only org members and
+// collaborators count; anyone else's comment is ignored.
+const CMD_FILE = path.join(RUNS, '.commands.json');
+async function scanCommands() {
+  if (!getConfig().commands) return;
+  const st = readJson(CMD_FILE) ?? { since: new Date().toISOString(), done: [] };
+  const started = new Date().toISOString();
+  for (const repo of repos()) {
+    let comments;
+    try { comments = await gh.restAll(`repos/${repo}/issues/comments?since=${encodeURIComponent(st.since)}`, { max: 300 }); } catch { continue; }
+    for (const c of comments) {
+      const m = (c.body ?? '').match(/^\s*\/miu\s+(retest|test)\b(.*)$/im);
+      if (!m || st.done.includes(c.id) || !/\/pull\/\d+/.test(c.html_url)) continue;
+      st.done.push(c.id);
+      if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association)) continue;
+      const pr = Number(c.html_url.match(/\/pull\/(\d+)/)[1]);
+      const rest = m[2].trim();
+      const full = /^full\b/i.test(rest);
+      const note = (full ? rest.replace(/^full\b/i, '') : rest).trim();
+      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '' });
+      await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: 'eyes' } }).catch(() => {});
+      console.log(`queued ${repo}#${pr} from /miu by ${c.user.login}${full ? ' (full)' : ''}`);
+    }
+  }
+  st.since = started;
+  st.done = st.done.slice(-500);
+  fs.writeFileSync(CMD_FILE, JSON.stringify(st, null, 2));
+}
+
+// ---- A person confirms or rejects a finding. Stored with the run; when the
+// run was posted, the PR comment gets a short "Checked by people" block.
+const localName = (() => { const r = spawnSync('git', ['config', 'user.name'], { encoding: 'utf8' }); return (r.stdout || '').trim() || process.env.USER || 'someone'; })();
+async function setReview(name, { key, state, title }, reviewer = localName) {
+  const dir = path.join(RUNS, name);
+  if (!fs.existsSync(path.join(dir, 'verdict.json'))) return { error: 'This run has no result yet' };
+  if (!/^(issue|claim):[\w.-]{1,40}$/.test(String(key))) return { error: 'Unknown finding' };
+  const reviews = readJson(path.join(dir, 'reviews.json')) ?? {};
+  if (state === 'confirmed' || state === 'not_a_bug') reviews[key] = { state, title: String(title ?? '').slice(0, 200), by: reviewer, at: new Date().toISOString() };
+  else delete reviews[key];
+  fs.writeFileSync(path.join(dir, 'reviews.json'), JSON.stringify(reviews, null, 2));
+  const posted = readJson(path.join(dir, 'posted.json'));
+  let pr = null;
+  if (posted?.url) {
+    const repo = posted.url.split('/').slice(3, 5).join('/');
+    const id = posted.url.match(/issuecomment-(\d+)/)?.[1];
+    if (id) {
+      // The comment can only be edited by whoever wrote it: the App, or the
+      // account that posted before the App was installed.
+      const fallback = posted.as !== 'Miu App';
+      const edit = async () => {
+        const r = { stdout: (await gh.rest('GET', `repos/${repo}/issues/comments/${id}`, { fallback })).body ?? '' };
+        const lines = Object.values(reviews).map((v) => `- ${v.state === 'confirmed' ? 'Confirmed' : 'Not a bug'} by ${v.by}: ${v.title}`);
+        const block = lines.length ? `<!-- miu-reviews -->\n**Checked by people**\n${lines.join('\n')}\n<!-- /miu-reviews -->` : '';
+        const old = r.stdout.replace(/\n$/, '');
+        const body = /<!-- miu-reviews -->[\s\S]*?<!-- \/miu-reviews -->/.test(old) ? old.replace(/<!-- miu-reviews -->[\s\S]*?<!-- \/miu-reviews -->/, block) : old.replace(/(\n<sub>Tested by Miu)/, `\n${block}\n$1`);
+        await gh.rest('PATCH', `repos/${repo}/issues/comments/${id}`, { body: { body }, fallback });
+      };
+      try { await edit(); pr = 'updated'; } catch (e) { pr = `not updated: ${e.message.split('\n')[0]}`; }
+    }
+  }
+  return { ok: true, reviews, pr };
+}
+
+// ---- The last N days in numbers.
+function stats(days = 7) {
+  const since = Date.now() - days * 24 * 3600 * 1000;
+  const out = { days, runs: 0, verdicts: {}, retests: 0, minutes: 0, tokens: 0, fresh: 0, calls: 0, confirmed: 0, notABug: 0, issues: 0, byRepo: {}, slowest: [] };
+  for (const r of listRuns()) {
+    const dir = path.join(RUNS, r.name);
+    const v = readJson(path.join(dir, 'verdict.json'));
+    if (!v) continue;
+    let at; try { at = fs.statSync(path.join(dir, 'verdict.json')).mtimeMs; } catch { continue; }
+    if (at < since) continue;
+    out.runs++;
+    out.verdicts[v.verdict] = (out.verdicts[v.verdict] ?? 0) + 1;
+    if (fs.existsSync(path.join(dir, 'context/retest.json'))) out.retests++;
+    const u = usage(dir);
+    const min = u ? u.wallMs / 60000 : 0;
+    out.minutes += min; out.tokens += u ? u.read + u.output : 0; out.fresh += u ? u.read - u.cacheRead + u.output : 0; out.calls += u?.calls ?? 0;
+    const res = readJson(path.join(dir, 'results.json'));
+    out.issues += (res?.issues ?? []).length;
+    for (const x of Object.values(readJson(path.join(dir, 'reviews.json')) ?? {})) x.state === 'confirmed' ? out.confirmed++ : out.notABug++;
+    const repo = r.repo?.split('/')[1] ?? '?';
+    out.byRepo[repo] = (out.byRepo[repo] ?? 0) + 1;
+    out.slowest.push({ name: r.name, title: r.title, minutes: Math.round(min) });
+  }
+  out.slowest = out.slowest.sort((a, b) => b.minutes - a.minutes).slice(0, 5);
+  out.avgMinutes = out.runs ? Math.round(out.minutes / out.runs) : 0;
+  out.avgTokens = out.runs ? Math.round(out.tokens / out.runs) : 0;
+  out.avgFresh = out.runs ? Math.round(out.fresh / out.runs) : 0;
+  return out;
+}
+
+// ---- Miu's GitHub App, made with GitHub's manifest flow. The state value ties
+// GitHub's redirect to a page this server handed out.
+const appStates = new Set();
+const page = (title, body) => `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{margin:0;background:#171717;color:#ececec;font:15px/1.55 -apple-system,system-ui,sans-serif;padding:48px 16px}main{max-width:620px;margin:auto}
+h1{font-size:22px;font-weight:600;margin:14px 0 6px}p,li{color:#c9c9c9}a{color:#ececec}code{background:#262626;padding:1px 6px;border-radius:5px;font-size:13px}
+.btn{display:inline-block;height:36px;line-height:36px;padding:0 16px;border-radius:9px;background:#ececec;color:#0d0d0d;font-weight:600;text-decoration:none;border:0;font-size:14px;cursor:pointer}
+.box{border:1px solid #353535;border-radius:12px;padding:18px 20px;margin:18px 0;background:#1f1f1f}h2{font-size:15px;font-weight:600;margin:26px 0 -6px}
+.repos{list-style:none;padding:0;margin:10px 0 0}.repo{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid #2a2a2a}.repo small{display:block;color:#9a9a9a;font-size:12px}
+.tbtn{height:28px;padding:0 12px;border-radius:8px;border:1px solid #353535;background:#262626;color:#c9c9c9;cursor:pointer;font:inherit;font-size:12.5px}.tbtn.on{background:#ececec;color:#0d0d0d;border-color:#ececec}.bad{color:#f07178}.ok{color:#6fcf97}ol{padding-left:20px}</style>
+<main><img src="/brand/miu-logo-big-white.svg" height="40" alt="Miu">${body}<p style="margin-top:28px"><a href="/">Back to Miu</a></p></main></html>`;
+
+// What the App can reach (when installed), next to what Miu has profiles for.
+async function repoRows() {
+  const prof = profiled(), on = new Set(repos());
+  let reach = null;
+  try {
+    const { token, kind } = await gh.tokenFor(appOwner());
+    if (kind === 'app') {
+      const r = await fetch('https://api.github.com/installation/repositories?per_page=100', { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'miu' } });
+      if (r.ok) reach = (await r.json()).repositories.map((x) => x.full_name);
+    }
+  } catch { /* no App yet */ }
+  const names = [...new Set([...prof.keys(), ...(reach ?? [])])].sort();
+  return { reach, rows: names.map((repo) => ({ repo, profile: prof.get(repo) ?? null, on: on.has(repo), reachable: reach ? reach.includes(repo) : null })) };
+}
+
+// A repo Miu has no profile for: Miu reads it and writes a first profile
+// (lib/newprofile.mjs), so nobody writes JSON to start.
+const addRepoForm = `<form id="add" style="margin-top:14px"><b>Add a repository</b><input name="repo" placeholder="owner/name" autocomplete="off" style="box-sizing:border-box;width:100%;height:34px;margin:6px 0 10px;padding:0 10px;background:#171717;border:1px solid #353535;border-radius:8px;color:#ececec"><button class="btn">Make a profile</button> <span id="addmsg"></span></form>`;
+const addRepoScript = `const addRepo = async (repo, msg) => { msg.textContent = 'Reading ' + repo + '...'; const r = await send('/api/profiles', { repo }); msg.textContent = r.error || 'Added. Miu tests its pull requests from now on.'; if (!r.error) setTimeout(() => location.reload(), 900); };
+document.querySelectorAll('[data-add]').forEach((b) => b.addEventListener('click', () => { b.disabled = true; addRepo(b.dataset.add, b); }));
+const af = document.getElementById('add');
+if (af) af.addEventListener('submit', (e) => { e.preventDefault(); addRepo(af.repo.value.trim(), document.getElementById('addmsg')); });`;
+
+async function githubAppPage(res) {
+  const st = await appStatus();
+  let body;
+  if (st.state === 'none') {
+    const state = crypto.randomBytes(16).toString('hex');
+    appStates.add(state);
+    const m = JSON.stringify(manifest(`${authCfg().publicUrl}/github-app/callback`)).replace(/"/g, '&quot;');
+    body = `<h1>Give Miu its own GitHub account</h1>
+<p>Without an App, Miu posts comments, labels and statuses with the gh login on this machine, so they show under that person's name. A GitHub App makes them show as <b>Miu [bot]</b>.</p>
+<div class="box"><p>The App may write comments, labels and commit statuses, and read code. It cannot push, merge or approve.</p>
+<form action="https://github.com/settings/apps/new?state=${state}" method="post"><input type="hidden" name="manifest" value="${m}"><button class="btn">Create the App on GitHub</button></form></div>
+<p>GitHub asks you to confirm the name. App names are unique on GitHub; if the one offered is taken, add a word to it.</p>`;
+  } else {
+    const steps = [
+      `<li>Add the logo: open <a href="${st.settingsUrl}" target="_blank" rel="noopener">the App's settings</a>, and under Display information upload <code>assets/brand/miu-avatar-512.png</code>.</li>`,
+      st.state === 'ready' ? `<li class="ok">Installed on ${escHtml(appOwner())} for ${st.repos.join(', ')}. Miu now posts as ${st.slug} [bot].</li>`
+        : st.state === 'partial' ? `<li class="bad">Installed, but not on ${st.missing.join(', ')}. <a href="${st.installUrl}" target="_blank" rel="noopener">Add those repos</a>.</li>`
+        : st.state === 'error' ? `<li class="bad">Could not check the App: ${escHtml(st.error)}</li>`
+        : `<li><a href="${st.installUrl}" target="_blank" rel="noopener">Install it on ${escHtml(appOwner() ?? 'your account')}</a> for ${escHtml(profiles().map((p) => p.repo.split('/')[1]).join(', ') || 'the repos Miu tests')}. On an organization, a member sends a request and an owner approves it. Until then Miu keeps posting with your gh login.</li>`,
+    ];
+    const cfg = authCfg();
+    const { reach, rows } = await repoRows();
+    const repoHtml = rows.map((r) => `<li class="repo"><span><b>${escHtml(r.repo)}</b><small>${r.profile ? escHtml(r.profile.kind === 'hub' ? 'App' : 'WordPress plugin') + ' profile' : 'no test profile yet'}${r.reachable === false ? ' · the App cannot reach it' : ''}</small></span>${r.profile ? `<button class="tbtn${r.on ? ' on' : ''}" data-repo="${escHtml(r.repo)}" data-on="${r.on ? '0' : '1'}">${r.on ? 'Tested' : 'Not tested'}</button>` : `<button class="tbtn" data-add="${escHtml(r.repo)}">Make a profile</button>`}</li>`).join('');
+    const signIn = cfg.ready
+      ? `<p class="ok">GitHub sign-in is set up${cfg.required ? ' and required' : '; it is off while the dashboard listens only on this machine'}.</p>`
+      : `<p>Sign-in needs the App's client secret. In <a href="${st.settingsUrl}" target="_blank" rel="noopener">the App's settings</a>: add the callback URL <code>${escHtml(cfg.publicUrl)}/auth/callback</code>, press <b>Generate a new client secret</b>, and paste it here. It is stored in <code>~/.config/miu/github-app.json</code> (only you can read it) and never shown again.</p>
+         <form id="sec"><input name="secret" type="password" autocomplete="off" placeholder="Client secret" style="box-sizing:border-box;width:100%;height:34px;margin:6px 0 10px;padding:0 10px;background:#171717;border:1px solid #353535;border-radius:8px;color:#ececec"><button class="btn">Save</button> <span id="secmsg"></span></form>`;
+    body = `<h1>Miu on GitHub: ${escHtml(st.slug)}</h1><p>Owned by ${escHtml(st.owner)}. Its key is in <code>~/.config/miu/github-app.json</code>, outside the repo.</p>
+<h2>The App</h2><div class="box"><ol>${steps.join('')}</ol></div>
+<h2>Repositories</h2><div class="box"><p>${reach ? 'The repos the App can reach, and the ones Miu has a test profile for.' : 'The repos Miu has a test profile for. Once the App is installed, the repos it can reach show here too.'} <a href="${st.installUrl}" target="_blank" rel="noopener">Connect repositories</a></p><ul class="repos">${repoHtml}</ul>${addRepoForm}</div>
+<h2>Sign-in</h2><div class="box">${signIn}</div>
+<p><a href="/github-app">Check again</a></p>
+<script>
+const send = (url, data) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-QA-Dashboard': '1' }, body: JSON.stringify(data) }).then((r) => r.json());
+document.querySelectorAll('[data-repo]').forEach((b) => b.addEventListener('click', async () => { b.disabled = true; await send('/api/config', { repo: b.dataset.repo, on: b.dataset.on === '1' }); location.reload(); }));
+${addRepoScript}
+const f = document.getElementById('sec');
+if (f) f.addEventListener('submit', async (e) => { e.preventDefault(); const r = await send('/api/app-secret', { secret: f.secret.value }); document.getElementById('secmsg').textContent = r.error || 'Saved.'; if (!r.error) setTimeout(() => location.reload(), 600); });
+</script>`;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(page('Miu on GitHub', body));
+}
+
+async function githubAppCallback(url, res) {
+  const state = url.searchParams.get('state');
+  const code = url.searchParams.get('code');
+  let body;
+  if (!state || !appStates.has(state) || !code) body = '<h1 class="bad">That link did not come from this page</h1><p>Start again from <a href="/github-app">Miu on GitHub</a>.</p>';
+  else {
+    appStates.delete(state);
+    try { const a = await convertManifest(code); res.writeHead(302, { Location: '/github-app' }); console.log(`github app ${a.slug} created`); return res.end(); }
+    catch (e) { body = `<h1 class="bad">The App was not saved</h1><p>${String(e.message).replace(/</g, '&lt;')}</p>`; }
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(page('Miu on GitHub', body));
+}
+
+// ---- sign-in and request safety
+const authCfg = () => auth.authConfig({ port: PORT, host: HOST });
+const sessions = auth.sessionStore(RUNS);
+const escHtml = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// A request from this machine without a proxy in between (set-up only).
+const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress) && !req.headers['x-forwarded-for'];
+const PUBLIC_PATHS = /^\/(auth\/(login|github|callback|setup|invite\/[\w-]+)|brand\/[\w.-]+)$/;
+function securityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  if (authCfg().secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+}
+// ---- sign-in pages (lib/users.mjs): set-up of the first account, email and
+// password, GitHub, and invite links. Server-rendered, so they work before
+// the dashboard loads.
+// The sign-in, set-up and invite pages: one narrow centred column, light or
+// dark with the system.
+const AUTH_CSS = `:root{--bg:#fff;--ink:#0d0d0d;--muted:#6e6e6e;--line:#d9d9d9;--field:#fff;--focus:#0d0d0d;--btn:#0d0d0d;--btn-ink:#fff;--alt:#f4f4f4;--bad:#d93036;--bad-bg:#fdecec}
+@media (prefers-color-scheme:dark){:root{--bg:#0d0d0d;--ink:#ececec;--muted:#8f8f8f;--line:#333;--field:#171717;--focus:#ececec;--btn:#ececec;--btn-ink:#0d0d0d;--alt:#1d1d1d;--bad:#ff7b80;--bad-bg:#2a1416}}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+main{min-height:100%;display:flex;flex-direction:column;align-items:center;padding:72px 16px 32px}
+.card{width:100%;max-width:340px;display:flex;flex-direction:column;align-items:center;text-align:center;flex:1}
+.mark{width:44px;height:44px;margin-bottom:28px}.mark.d{display:none}@media (prefers-color-scheme:dark){.mark.l{display:none}.mark.d{display:block}}
+h1{font-size:30px;line-height:1.2;font-weight:600;letter-spacing:-.02em;margin:0 0 10px}
+.sub{color:var(--muted);margin:0 0 28px;font-size:15px}.sub b{color:var(--ink);font-weight:500}
+form{width:100%;display:flex;flex-direction:column;gap:12px;margin:0}
+input{width:100%;height:52px;border-radius:999px;border:1px solid var(--line);background:var(--field);color:var(--ink);padding:0 20px;font:inherit;font-size:16px;outline:0;transition:border-color .15s}
+input::placeholder{color:var(--muted)}input:focus{border-color:var(--focus);box-shadow:0 0 0 1px var(--focus)}
+.hint{color:var(--muted);font-size:12.5px;text-align:left;margin:-4px 20px 2px}.hint code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--alt);padding:1px 5px;border-radius:5px;white-space:nowrap}
+input:disabled{color:var(--muted);background:var(--alt);border-color:transparent}
+button,.btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;height:52px;border-radius:999px;border:0;background:var(--btn);color:var(--btn-ink);font:inherit;font-size:16px;font-weight:500;cursor:pointer;text-decoration:none;margin-top:4px;transition:opacity .15s}
+button:hover,.btn:hover{opacity:.86}button:focus-visible,.btn:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+.btn.alt{background:transparent;color:var(--ink);border:1px solid var(--line);margin:0}.btn.alt:hover{opacity:1;background:var(--alt)}.btn svg{width:20px;height:20px}
+.or{display:flex;align-items:center;gap:14px;width:100%;color:var(--muted);font-size:12.5px;margin:22px 0}.or::before,.or::after{content:"";flex:1;height:1px;background:var(--line)}
+.bad{width:100%;color:var(--bad);background:var(--bad-bg);border-radius:14px;padding:10px 16px;font-size:14px;margin:0 0 16px;text-align:left}
+.foot{color:var(--muted);font-size:14px;margin-top:24px}.foot a{color:var(--ink)}
+footer{color:var(--muted);font-size:12.5px;margin-top:40px}footer a{color:inherit}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}`;
+const GH_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
+const authPage = (title, { heading, sub = '', message = '', body, foot = '' }, status = 200) => (res) => {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>${escHtml(title)} | Miu</title><link rel="icon" href="/brand/miu-favicon.svg"><style>${AUTH_CSS}</style>
+<main><div class="card"><img class="mark l" src="/brand/miu-mark-black.svg" alt="Miu"><img class="mark d" src="/brand/miu-mark-white.svg" alt="Miu">
+<h1>${heading}</h1>${sub ? `<p class="sub">${sub}</p>` : ''}${message ? `<p class="bad" role="alert">${escHtml(message)}</p>` : ''}${body}${foot ? `<p class="foot">${foot}</p>` : ''}</div>
+<footer>Miu, pull request QA</footer></main><script>
+// The page asked for (#settings, a run) is after the # and never reaches the server: carry it through sign-in.
+if (location.hash) {
+  document.querySelectorAll('input[name=next]').forEach((i) => { i.value = i.value.split('#')[0] + location.hash; });
+  document.querySelectorAll('a[href^="/auth/github"]').forEach((a) => { const u = new URL(a.href); if (!u.searchParams.has('invite')) { u.searchParams.set('next', (u.searchParams.get('next') || '/').split('#')[0] + location.hash); a.href = u.pathname + u.search; } });
+}
+</script></html>`);
+};
+// [name, placeholder, type, extra attributes, value]
+const fieldsHtml = (fs) => fs.map(([name, label, type = 'text', extra = '', value = '']) => `<input name="${name}" type="${type}" placeholder="${label}" aria-label="${label}" ${value ? `value="${escHtml(value)}"` : ''} ${extra} required>`).join('');
+function loginPage(res, message = '', next = '/', email = '') {
+  const cfg = authCfg();
+  if (!users.hasUsers()) return setupPage(res, message);
+  const gh = cfg.ready ? `<div class="or">OR</div><a class="btn alt" href="/auth/github?next=${encodeURIComponent(next)}">${GH_ICON}Continue with GitHub</a>` : '';
+  return authPage('Sign in', {
+    heading: 'Welcome back',
+    sub: 'Sign in to Miu.',
+    message,
+    body: `<form method="post" action="/auth/login"><input type="hidden" name="next" value="${escHtml(next)}">${fieldsHtml([['email', 'Email address', 'email', `autocomplete="username" ${email ? '' : 'autofocus'}`, email], ['password', 'Password', 'password', `autocomplete="current-password" ${email ? 'autofocus' : ''}`]])}<button>Continue</button></form>${gh}`,
+    foot: 'No account? Ask a Miu admin for an invite.',
+  }, 401)(res);
+}
+function setupPage(res, message = '', f = {}) {
+  return authPage('Set up', {
+    heading: 'Set up Miu',
+    sub: 'Create the owner account. You can invite your team after.',
+    message,
+    body: `<form method="post" action="/auth/setup"><input type="hidden" name="next" value="/">${fieldsHtml([['code', 'Setup code', 'text', 'autocomplete="one-time-code" spellcheck="false" autofocus', f.code]])}<p class="hint">Find it in the server log, or in <code>~/.config/miu/setup-code</code></p>${fieldsHtml([['name', 'Your name', 'text', 'autocomplete="name"', f.name], ['email', 'Email address', 'email', 'autocomplete="username"', f.email], ['password', 'Password', 'password', 'autocomplete="new-password" minlength="10"']])}<p class="hint">At least 10 characters.</p><button>Create account</button></form>`,
+  })(res);
+}
+function invitePage(res, token, message = '') {
+  const cfg = authCfg();
+  const inv = users.inviteFor(token);
+  if (!inv) return authPage('Invite', { heading: 'This invite has expired', sub: 'It was used already, or it is older than 7 days. Ask a Miu admin for a new one.', body: '<a class="btn" href="/auth/login">Go to sign in</a>' }, 404)(res);
+  const who = inv.email ?? inv.github;
+  const body = inv.github && !inv.email
+    ? (cfg.ready ? `<a class="btn" href="/auth/github?invite=${encodeURIComponent(token)}">${GH_ICON}Continue with GitHub</a>` : '<p class="bad">GitHub sign-in is not set up on this Miu yet. Ask an admin to invite you by email instead.</p>')
+    : `<form method="post" action="/auth/invite/${escHtml(token)}"><input type="email" value="${escHtml(inv.email)}" aria-label="Email address" disabled>${fieldsHtml([['name', 'Your name', 'text', 'autocomplete="name" autofocus'], ['password', 'Choose a password', 'password', 'autocomplete="new-password" minlength="10"']])}<p class="hint">At least 10 characters.</p><button>Join Miu</button></form>`;
+  return authPage('Join', { heading: 'Join Miu', sub: `<b>${escHtml(inv.by)}</b> invited ${escHtml(who)} as ${inv.role === 'admin' ? 'an' : 'a'} <b>${escHtml(inv.role)}</b>.`, message, body })(res);
+}
+// A form posted to these pages must come from this site.
+function sameSite(req) {
+  const o = req.headers.origin || req.headers.referer || '';
+  if (!o) return false;
+  try { const u = new URL(o); return u.host === req.headers.host || u.origin === new URL(authCfg().publicUrl).origin; } catch { return false; }
+}
+function readForm(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 8000) req.destroy(); });
+    req.on('end', () => resolve(Object.fromEntries(new URLSearchParams(body))));
+  });
+}
+const clientIp = (req) => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+const signIn = (res, user, next = '/') => {
+  res.writeHead(302, { 'Set-Cookie': auth.sessionCookie(sessions.create({ uid: user.id, login: user.github || user.email, name: user.name, avatar: user.avatar }), authCfg()), Location: next.startsWith('/') && !next.startsWith('//') ? next : '/' });
+  res.end();
+  users.touch(user.id);
+  console.log(`signed in: ${user.name} (${user.role})`);
+};
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  securityHeaders(res);
+  const json = (o) => { res.writeHead(o ? 200 : 404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
+  const cfg = authCfg();
+  const session = sessions.get(auth.readCookie(req));
+  // Who this is and what they may do: the account's role, read fresh on each
+  // request so a change of role or a removal takes effect at once. With
+  // sign-in off (this machine, no accounts yet) the person at the keyboard is
+  // the owner.
+  const me = session?.uid ? users.get(session.uid) : null;
+  const role = !cfg.required ? 'owner' : me?.role ?? null;
+  if (me) users.touch(me.id);
+  const admin = users.atLeast(role, 'admin');
+  // ---- sign-in routes
+  if (url.pathname === '/auth/setup') {
+    if (users.hasUsers()) { res.writeHead(302, { Location: '/' }); return res.end(); }
+    if (req.method !== 'POST') { console.log(`Setup code for the owner account: ${users.setupCode()} (also in ~/.config/miu/setup-code)`); return setupPage(res); }
+    if (!sameSite(req)) return setupPage(res, 'Send the form from this page.');
+    readForm(req).then((f) => { try { signIn(res, users.createOwner(f), f.next || '/'); } catch (e) { setupPage(res, e.message, f); } });
+    return;
+  }
+  if (url.pathname === '/auth/login') {
+    if (req.method !== 'POST') return loginPage(res, '', url.searchParams.get('next') || '/');
+    if (!sameSite(req)) return loginPage(res, 'Send the form from this page.');
+    readForm(req).then((f) => { try { signIn(res, users.signInPassword(f.email, f.password, clientIp(req)), f.next || '/'); } catch (e) { loginPage(res, e.message, f.next || '/', f.email); } });
+    return;
+  }
+  if (url.pathname === '/auth/github') {
+    if (!cfg.ready) return loginPage(res, 'GitHub sign-in is not set up on this Miu.');
+    res.writeHead(302, { Location: auth.loginRedirect(cfg, url.searchParams.get('next') || '/', url.searchParams.get('invite')) }); return res.end();
+  }
+  if (url.pathname === '/auth/callback') {
+    if (!cfg.ready) return loginPage(res);
+    auth.finishLogin(cfg, url).then(({ github, next, invite }) => {
+      let user = users.signInGithub(github.login);
+      if (!user && invite) user = users.acceptInvite(invite, { name: github.name, githubLogin: github.login });
+      if (!user) return loginPage(res, `${github.login} is not a member of this Miu. Ask an admin for an invite.`);
+      signIn(res, user, next);
+    }).catch((e) => loginPage(res, e.message));
+    return;
+  }
+  let m0 = url.pathname.match(/^\/auth\/invite\/([\w-]{20,64})$/);
+  if (m0) {
+    if (req.method !== 'POST') return invitePage(res, m0[1]);
+    if (!sameSite(req)) return invitePage(res, m0[1], 'Send the form from this page.');
+    readForm(req).then((f) => { try { signIn(res, users.acceptInvite(m0[1], { name: f.name, password: f.password })); } catch (e) { invitePage(res, m0[1], e.message); } });
+    return;
+  }
+  if (url.pathname === '/auth/logout' && req.method === 'POST' && req.headers['x-qa-dashboard'] === '1') {
+    sessions.drop(auth.readCookie(req));
+    res.writeHead(200, { 'Set-Cookie': auth.clearCookie(cfg), 'Content-Type': 'application/json' }); return res.end('{"ok":true}');
+  }
+  // The gate: with sign-in on, nothing but the sign-in pages and the logo
+  // without an account. Before the first account, the set-up page; the
+  // GitHub App set-up page only from the machine itself.
+  if (cfg.required && !me && !PUBLIC_PATHS.test(url.pathname)) {
+    const setup = /^\/(github-app(\/callback)?|api\/app-secret)$/.test(url.pathname) && isLocal(req) && !cfg.ready;
+    if (!setup) {
+      if (req.method === 'GET' && !url.pathname.startsWith('/api/') && !url.pathname.startsWith('/evidence/')) return users.hasUsers() ? loginPage(res, '', url.pathname + url.search) : setupPage(res);
+      res.writeHead(401, { 'Content-Type': 'application/json' }); return res.end('{"error":"Sign in first"}');
+    }
+  }
+  const deny = (msg) => { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: msg })); };
+  if (cfg.required && !admin && (ADMIN_ONLY.test(url.pathname) || url.pathname.startsWith('/api/members'))) return deny('Only a Miu admin can change settings and members.');
+  // A viewer reads; changing anything (other than their own password) needs member or above.
+  if (cfg.required && req.method === 'POST' && !users.atLeast(role, 'member') && url.pathname !== '/api/account/password') return deny('Viewers can read reports. Ask an admin to make you a member to test or post.');
+  if (req.method === 'GET' && url.pathname === '/api/me') return json({ auth: cfg.required, ready: cfg.ready, admin, role, user: me ? { id: me.id, login: me.github || me.email, name: me.name, avatar: me.avatar, email: me.email, github: me.github } : null });
+  if (req.method === 'GET' && url.pathname === '/api/members') return json(users.list());
+  if (req.method === 'GET') {
+    if (url.pathname === '/') {
+      // Scripts run only with this request's nonce; nothing may frame the page.
+      const nonce = crypto.randomBytes(16).toString('base64');
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+        'Content-Security-Policy': [
+          "default-src 'self'", `script-src 'nonce-${nonce}' https://cdnjs.cloudflare.com`, "style-src 'self' 'unsafe-inline'",
+          "img-src 'self' data: blob: https://res.cloudinary.com https://github.com https://*.githubusercontent.com https://gravatar.com https://*.gravatar.com",
+          "media-src 'self' https://res.cloudinary.com", "connect-src 'self'", "font-src 'self'",
+          "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self' https://github.com", "object-src 'none'",
+        ].join('; '),
+      });
+      // The repos the page names, from the profiles; < is escaped so the JSON cannot end the script.
+      const known = JSON.stringify({ owner: project().owner, slack: project().slack_channel, repos: [...profiled()].map(([full, p]) => ({ full, name: full.split('/')[1], label: p.label, role: p.role })) }).replace(/</g, '\\u003c');
+      return res.end(fs.readFileSync(PAGE_FILE, 'utf8').replace('<script>\n', `<script>\nconst MIU = ${known};\n`).replace(/<script(?=[\s>])/g, `<script nonce="${nonce}"`));
+    }
+    if (url.pathname === '/api/runs') return json(listRuns());
+    if (url.pathname === '/api/fixes') return json(listFixes());
+    if (url.pathname === '/api/options') return json({ models: offered(), efforts: EFFORTS, repos: repos(), live: liveRun() });
+    if (url.pathname === '/api/instructions') return json(listInstructions(RUNS));
+    if (url.pathname === '/api/github-user') return json(ghuser.loginState());
+    if (url.pathname === '/api/suggest') { ruleSuggestions().then(json, (e) => json({ error: e.message })); return; }
+    if (url.pathname === '/api/screenshots') { shotsUsage().then(json, (e) => json({ error: e.message })); return; }
+    if (url.pathname === '/api/connections') {
+      // A sign-in the service refused in a run shows as not connected, whatever the CLI says.
+      const modes = getConfig().connections ?? {};
+      conn.statusAll(modes, { fresh: url.searchParams.has('fresh') }).then((all) => json(all.map((c) => {
+        const r = refusal(RUNS, c.engine, modes[c.engine] ?? c.mode);
+        return r ? { ...c, ready: false, problem: `${c.label} refused this sign-in in a run (${r.message}). Sign in again.` } : c;
+      })), (e) => json({ error: e.message }));
+      return;
+    }
+    if (url.pathname === '/api/prs') return json(prView());
+    if (url.pathname === '/api/history') {
+      const repo = url.searchParams.get('repo'), n = Number(url.searchParams.get('pr'));
+      if (!repos().includes(repo) || !Number.isInteger(n)) return json({ error: 'Unknown pull request' });
+      prHistory(repo, n).then(json, (e) => json({ error: e.message }));
+      return;
+    }
+    if (url.pathname === '/api/stats') return json(stats(Math.min(90, Number(url.searchParams.get('days')) || 7)));
+    if (url.pathname === '/github-app') return void githubAppPage(res).catch((e) => { res.writeHead(500); res.end(e.message); });
+    if (url.pathname === '/github-app/callback') return void githubAppCallback(url, res).catch((e) => { res.writeHead(500); res.end(e.message); });
+    let m = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
+    if (m) return json(safeName(m[1]) && detail(m[1]));
+    if (url.pathname === '/brand' || url.pathname === '/brand/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(fs.readFileSync(path.join(ROOT, 'assets/brand/preview.html'), 'utf8').replace('<meta charset="utf-8">', '<meta charset="utf-8"><base href="/brand/">')); }
+    m = url.pathname.match(/^\/brand\/([\w.-]+\.(svg|png))$/);
+    if (m) return sendFile(res, path.join(ROOT, 'assets/brand', m[1]));
+    m = url.pathname.match(/^\/evidence\/([^/]+)\/([^/]+)$/);
+    if (m && safeName(decodeURIComponent(m[1])) && safeName(decodeURIComponent(m[2]))) {
+      const runName = decodeURIComponent(m[1]), file = decodeURIComponent(m[2]);
+      const local = path.join(RUNS, runName, 'evidence', file);
+      // A screenshot pruned from this disk is served from where it was uploaded.
+      if (!fs.existsSync(local)) {
+        const up = readJson(path.join(RUNS, runName, 'screenshots.json'))?.[file] ?? readJson(path.join(RUNS, runName, 'screenshots.carried.json'))?.[file];
+        if (typeof up === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(up)) { res.writeHead(302, { Location: up, 'Cache-Control': 'max-age=86400' }); return res.end(); }
+      }
+      return sendFile(res, local);
+    }
+    res.writeHead(404); return res.end();
+  }
+  if (req.method === 'POST') {
+    // Starting a run spends plan usage, so only this page may do it, not
+    // another site open in the same browser. The custom header forces a CORS
+    // preflight that is never answered, and the Origin must be this server.
+    // Writes need the custom header (a cross-site form cannot send it) and,
+    // when there is one, an Origin of this server. With sign-in on, the
+    // Origin is required and must be the public URL.
+    const origin = req.headers.origin ?? '';
+    const own = new URL(cfg.publicUrl).origin;
+    const originOk = cfg.required ? origin === own : (!origin || origin === own || /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin));
+    if (req.headers['x-qa-dashboard'] !== '1' || !originOk) { res.writeHead(403); return res.end(); }
+    let body = '';
+    const limit = url.pathname === '/api/instructions' ? 200000 : 10000;
+    req.on('data', (c) => { body += c; if (body.length > limit) req.destroy(); });
+    req.on('end', () => {
+      let data = {}; try { data = JSON.parse(body || '{}'); } catch { /* empty body */ }
+      if (url.pathname === '/api/app-secret') {
+        try { auth.saveClientSecret(String(data.secret || '').trim()); return json({ ok: true }); } catch (e) { return json({ error: e.message }); }
+      }
+      if (url.pathname === '/api/config') { setConfig(data).then(json, (e) => json({ error: e.message })); return; }
+      if (url.pathname === '/api/profiles') { addProfile(String(data.repo || '').trim()).then((p) => json({ ok: true, repo: p.repo }), (e) => json({ error: e.message.replace(/^GitHub GET [^:]+: /, '') })); return; }
+      if (url.pathname === '/api/instructions') { try { return json(saveInstruction(RUNS, data)); } catch (e) { return json({ error: e.message }); } }
+      // Members (admin; the gate above checks) and one's own password.
+      if (url.pathname === '/api/members/invite') {
+        try { const token = users.invite(data, { role, name: me?.name ?? 'the owner' }); return json({ link: `${cfg.publicUrl}/auth/invite/${token}`, ...users.list() }); } catch (e) { return json({ error: e.message }); }
+      }
+      if (url.pathname === '/api/members/role') { try { return json(users.setRole(String(data.id), String(data.role), { role })); } catch (e) { return json({ error: e.message }); } }
+      if (url.pathname === '/api/members/remove') {
+        if (me && data.id === me.id) return json({ error: 'You cannot remove yourself. Ask another admin.' });
+        try { return json(users.remove(String(data.id), { role })); } catch (e) { return json({ error: e.message }); }
+      }
+      if (url.pathname === '/api/members/revoke') { users.revokeInvite(String(data.id)); return json(users.list()); }
+      if (url.pathname === '/api/account/password') {
+        if (!me) return json({ error: 'Sign in first.' });
+        try { users.changePassword(me.id, data.current, data.next); return json({ ok: true }); } catch (e) { return json({ error: e.message }); }
+      }
+      if (url.pathname === '/api/github-user/connect') { ghuser.startLogin().then(json, (e) => json({ error: e.message })); return; }
+      if (url.pathname === '/api/github-user/disconnect') return json(ghuser.disconnect());
+      if (url.pathname === '/api/github-user/push-token') { ghuser.savePushToken(data.token, repos()).then(json, (e) => json({ error: e.message })); return; }
+      // AI connections. A secret comes in once and only its last four characters go back out.
+      if (url.pathname === '/api/connections/secret') {
+        try { conn.saveSecret(String(data.engine), String(data.kind), data.value); } catch (e) { return json({ error: e.message }); }
+        return conn.statusAll(getConfig().connections, { fresh: true }).then(json, (e) => json({ error: e.message }));
+      }
+      if (url.pathname === '/api/connections/test') {
+        if (!ENGINES[data.engine]) return json({ error: 'Unknown engine' });
+        conn.test(data.engine, getConfig().connections[data.engine]).then(json, (e) => json({ ok: false, error: e.message })); return;
+      }
+      // Account sign-in (OAuth). The page to open comes from the CLI; only the
+      // two providers' sign-in pages are handed to the browser.
+      if (url.pathname === '/api/connections/signin') {
+        const start = data.engine === 'codex' ? conn.codexSignIn() : data.engine === 'claude' ? conn.claudeSignIn() : Promise.resolve({ error: 'Unknown engine' });
+        start.then((r) => json(r.url && !/^https:\/\/(claude\.com|claude\.ai|auth\.openai\.com)\//.test(r.url) ? { error: 'The sign-in page was not one Miu expects.' } : r), (e) => json({ error: e.message })); return;
+      }
+      if (url.pathname === '/api/connections/code') { conn.claudeCode(data.code).then(json, (e) => json({ error: e.message })); return; }
+      if (url.pathname === '/api/connections/signout') { (data.engine === 'codex' ? conn.codexSignOut() : Promise.resolve({ error: 'Unknown engine' })).then(json, (e) => json({ error: e.message })); return; }
+      if (url.pathname === '/api/refresh') { refreshPrs(); return json({ ok: true }); }
+      if (url.pathname === '/api/test') {
+        // "Test now" from the list: queue it; it starts at once when nothing runs.
+        if (!repos().includes(data.repo) || !Number.isInteger(Number(data.pr))) return json({ error: 'Unknown pull request' });
+        return json(enqueue(data.repo, Number(data.pr), 'asked from the dashboard', { full: data.full === true, force: data.force === true }));
+      }
+      // Change the order of the line: a pull request that matters more can go first.
+      if (url.pathname === '/api/queue/move') {
+        const i = queue.findIndex((q) => q.repo === data.repo && q.pr === Number(data.pr));
+        if (i < 0) return json({ error: 'It is not in the queue any more: it started or was removed.' });
+        // A place in the line (dragged there), or top / up / down / bottom.
+        const to = Number.isInteger(data.to) ? data.to : { top: 0, up: i - 1, down: i + 1, bottom: queue.length - 1 }[data.to];
+        if (to === undefined) return json({ error: 'Move it to a place in the line, or top, up, down or bottom.' });
+        const [item] = queue.splice(i, 1);
+        queue.splice(Math.max(0, Math.min(queue.length, to)), 0, item);
+        saveQueue();
+        console.log(`queue: ${data.repo}#${data.pr} moved from ${i + 1} to ${queue.indexOf(item) + 1} by ${me?.name ?? 'the local user'}`);
+        return json({ ok: true, queue: queue.map((q) => `${q.repo}#${q.pr}`) });
+      }
+      if (url.pathname === '/api/unqueue') {
+        const i = queue.findIndex((q) => q.repo === data.repo && q.pr === Number(data.pr));
+        if (i > -1) { queue.splice(i, 1); saveQueue(); }
+        return json({ ok: true });
+      }
+      if (url.pathname === '/api/start') return json(startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false }));
+      const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);
+      if (rv && safeName(rv[1])) { setReview(rv[1], data, session?.login ?? localName).then(json, (e) => json({ error: e.message })); return; }
+      const fx = url.pathname.match(/^\/api\/runs\/([^/]+)\/fix$/);
+      if (fx && safeName(fx[1])) return json(startFix({ run: fx[1], by: session?.login ?? localName }));
+      const fs2 = url.pathname.match(/^\/api\/fixes\/([^/]+)\/stop$/);
+      if (fs2 && safeName(fs2[1])) return json(stopFix(fs2[1]));
+      const pm = url.pathname.match(/^\/api\/runs\/([^/]+)\/post$/);
+      if (pm && safeName(pm[1])) {
+        const name = pm[1];
+        if (posting.has(name)) return json({ error: 'Already posting this run' });
+        posting.add(name);
+        postRun(path.join(RUNS, name), { log: (m) => console.error(`post ${name}: ${m}`) })
+          .then(json, (e) => json({ error: e.message.split('\n')[0] }))
+          .finally(() => posting.delete(name));
+        return;
+      }
+      const sr = url.pathname.match(/^\/api\/runs\/([^/]+)\/steer$/);
+      if (sr && safeName(sr[1])) return json(steerRun(sr[1], data.text, session?.login ?? localName));
+      const m = url.pathname.match(/^\/api\/runs\/([^/]+)\/(model|stop)$/);
+      if (m && safeName(m[1])) return json(m[2] === 'model' ? switchModel(m[1], data.model) : stopRun(m[1]));
+      res.writeHead(404); res.end();
+    });
+    return;
+  }
+  res.writeHead(405); res.end();
+});
+const ADMIN_ONLY = /^\/(api\/config|api\/profiles|api\/instructions|api\/github-user(\/[\w-]+)?|api\/app-secret|api\/connections(\/[\w-]+)?|github-app(\/callback)?)$/;
+process.on('uncaughtException', (e) => console.error('dashboard error (kept running):', e));
+{
+  const cfg = authCfg();
+  // A new install: the one-time code that makes the owner account (lib/users.mjs).
+  if (cfg.required && !users.hasUsers()) console.log(`Miu has no accounts yet. Open ${cfg.publicUrl}/auth/setup and use the setup code ${users.setupCode()} (also in ~/.config/miu/setup-code).`);
+  server.listen(PORT, HOST, () => console.log(`Miu: ${cfg.publicUrl}  (listening on ${HOST}:${PORT}, sign-in ${cfg.required ? 'on' : 'off'}, runs from ${RUNS})`));
+}
+
+
+// The page itself. Read per request so edits show on reload.
+const PAGE_FILE = path.join(ROOT, 'lib/dashboard.html');

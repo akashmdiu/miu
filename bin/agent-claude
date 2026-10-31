@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The claude CLI, run as the agent account (lib/agentuser.mjs). The Agent SDK
+# starts this in place of claude when MIU_AGENT_USER is set.
+exec sudo -n -E -u "$MIU_AGENT_USER" "${MIU_AGENT_LIB:-/usr/local/lib/miu}/agent-exec" "$MIU_AGENT_CLAUDE_BIN" "$@"
