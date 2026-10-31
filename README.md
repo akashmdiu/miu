@@ -7,7 +7,7 @@
 
 **Miu tests your WordPress plugin's pull requests on a real site, and posts the result on the pull request.**
 
-[![Watch the one-minute intro](docs/images/video.png)](https://res.cloudinary.com/ehtetpi9/video/upload/v1793454474/261031_194747_miu-intro-v8.mp4)
+[![Watch the one-minute intro](docs/images/video.png)](https://res.cloudinary.com/ehtetpi9/video/upload/v1793457252/261031_203352_miu-01-intro.mp4)
 
 ## What it does
 
@@ -25,6 +25,8 @@ It runs on your own server, with your own AI account. Nothing passes through us.
 <img src="docs/images/settings.png" alt="Settings: sign in with Claude or ChatGPT, choose which pull requests to test">
 
 ## Install
+
+[![Watch: set up Miu in under a minute](docs/images/video-setup.png)](https://res.cloudinary.com/ehtetpi9/video/upload/v1793456409/261031_201932_miu-02-setup.mp4)
 
 You need a server with Ubuntu 24.04 and 4 GB of memory. Run:
 
