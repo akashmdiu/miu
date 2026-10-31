@@ -63,7 +63,8 @@ export DEBIAN_FRONTEND=noninteractive
 # ---------------------------------------------------------------- packages
 say "Installing system packages"
 apt-get update -qq
-apt-get install -y -qq git curl ca-certificates gnupg acl jq unzip xz-utils xvfb xauth \
+# iproute2 and systemd-resolved carry rexenv's .rex names; a minimal image can lack them.
+apt-get install -y -qq git curl ca-certificates gnupg acl jq unzip xz-utils xvfb xauth iproute2 systemd-resolved default-mysql-client-core \
   php-cli php-xml php-mbstring php-curl php-zip php-mysql php-gd php-intl composer >/dev/null
 if ! command -v gh >/dev/null; then
   install -d -m 0755 /etc/apt/keyrings
@@ -153,7 +154,7 @@ fi
 
 say "Installing Chromium"
 export PLAYWRIGHT_BROWSERS_PATH="$OPT/ms-playwright"
-(cd "$APP" && npx --yes playwright install --with-deps chromium >/dev/null)
+(cd "$APP" && npx --yes playwright install --with-deps chromium >/dev/null 2>&1) || die "Chromium did not install; run: cd $APP && sudo npx playwright install --with-deps chromium"
 chmod -R a+rX "$OPT"
 
 # ---------------------------------------------------------------- profiles
