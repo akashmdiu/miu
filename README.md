@@ -7,7 +7,7 @@
 
 **Miu tests your WordPress plugin's pull requests on a real site, and posts the result on the pull request.**
 
-[![Watch the one-minute intro](docs/images/video.png)](https://res.cloudinary.com/ehtetpi9/video/upload/v1793424821/261031_113331_miu-intro-v7.mp4)
+[![Watch the one-minute intro](docs/images/video.png)](https://res.cloudinary.com/ehtetpi9/video/upload/v1793454474/261031_194747_miu-intro-v8.mp4)
 
 ## What it does
 
