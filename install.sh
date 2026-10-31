@@ -169,8 +169,11 @@ export PLAYWRIGHT_BROWSERS_PATH="$OPT/ms-playwright"
 chmod -R a+rX "$OPT"
 
 # ---------------------------------------------------------------- profiles
-install -d -m 0755 "$ETC/profiles"
+# Miu's account owns the profiles: the dashboard's "Make a profile" writes here.
+install -d -m 0755 "$ETC"
+install -d -o "$MIU_USER" -g "$MIU_USER" -m 0755 "$ETC/profiles"
 [ -f "$ETC/profiles/project.json" ] || cp "$APP/docs/examples/project.json" "$ETC/profiles/project.json"
+chown -R "$MIU_USER:$MIU_USER" "$ETC/profiles"
 
 # --------------------------------------------------- the agent's own account
 if [ "$AGENT_USER_ON" = 1 ]; then
