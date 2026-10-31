@@ -16,7 +16,7 @@ import { postRun } from '../lib/postrun.mjs';
 import { qaSignals, prHistory } from '../lib/prsignals.mjs';
 import { partnersOf, roleOf } from '../lib/pairs.mjs';
 import { project, profiles, roles } from '../lib/project.mjs';
-import { addProfile } from '../lib/newprofile.mjs';
+import { addProfile, saveProfile, profileText } from '../lib/newprofile.mjs';
 import { MODELS, ENGINES, EFFORTS, engineOf } from '../lib/engines.mjs';
 import * as conn from '../lib/connections.mjs';
 import { rmAny } from '../lib/agentuser.mjs';
@@ -1177,6 +1177,25 @@ document.querySelectorAll('[data-add]').forEach((b) => b.addEventListener('click
 const af = document.getElementById('add');
 if (af) af.addEventListener('submit', (e) => { e.preventDefault(); addRepo(af.repo.value.trim(), document.getElementById('addmsg')); });`;
 
+// One repo's profile as JSON, for an admin to change (docs/profiles.md says what each field does).
+function profilePage(url, res) {
+  const repo = url.searchParams.get('repo') ?? '';
+  const text = gh.validRepo(repo) ? profileText(repo) : null;
+  res.writeHead(text == null ? 404 : 200, { 'Content-Type': 'text/html; charset=utf-8' });
+  if (text == null) return res.end(page('No such profile', '<h1>No profile for that repo</h1>'));
+  res.end(page(`Profile: ${repo}`, `<h1>How Miu tests ${escHtml(repo)}</h1>
+<p>The test profile, as JSON. <a href="https://github.com/akashmdiu/miu/blob/main/docs/profiles.md" target="_blank" rel="noopener">What each field does</a>. A change applies from the next run.</p>
+<form id="pf"><textarea name="text" spellcheck="false" style="box-sizing:border-box;width:100%;height:60vh;padding:12px;background:#171717;border:1px solid #353535;border-radius:8px;color:#ececec;font:13px/1.5 ui-monospace,Menlo,monospace">${escHtml(text)}</textarea>
+<p><button class="btn">Save</button> <span id="pfmsg"></span></p></form>
+<p><a href="/github-app">Back to GitHub and repositories</a></p>
+<script>
+const f = document.getElementById('pf');
+f.addEventListener('submit', async (e) => { e.preventDefault(); const m = document.getElementById('pfmsg'); m.textContent = 'Saving...';
+  const r = await fetch('/api/profiles/save', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-QA-Dashboard': '1' }, body: JSON.stringify({ repo: ${JSON.stringify(repo).replace(/</g, '\\u003c')}, text: f.text.value }) }).then((x) => x.json());
+  m.textContent = r.error || 'Saved. The next run uses it.'; });
+</script>`));
+}
+
 async function githubAppPage(res) {
   const st = await appStatus();
   let body;
@@ -1199,7 +1218,7 @@ async function githubAppPage(res) {
     ];
     const cfg = authCfg();
     const { reach, rows } = await repoRows();
-    const repoHtml = rows.map((r) => `<li class="repo"><span><b>${escHtml(r.repo)}</b><small>${r.profile ? escHtml(r.profile.kind === 'hub' ? 'App' : 'WordPress plugin') + ' profile' : 'no test profile yet'}${r.reachable === false ? ' · the App cannot reach it' : ''}</small></span>${r.profile ? `<button class="tbtn${r.on ? ' on' : ''}" data-repo="${escHtml(r.repo)}" data-on="${r.on ? '0' : '1'}">${r.on ? 'Tested' : 'Not tested'}</button>` : `<button class="tbtn" data-add="${escHtml(r.repo)}">Make a profile</button>`}</li>`).join('');
+    const repoHtml = rows.map((r) => `<li class="repo"><span><b>${escHtml(r.repo)}</b><small>${r.profile ? escHtml(r.profile.kind === 'hub' ? 'App' : 'WordPress plugin') + ' profile' : 'no test profile yet'}${r.reachable === false ? ' · the App cannot reach it' : ''}</small></span>${r.profile ? `<a class="tbtn" style="line-height:28px;text-decoration:none" href="/github-app/profile?repo=${encodeURIComponent(r.repo)}">Edit</a> <button class="tbtn${r.on ? ' on' : ''}" data-repo="${escHtml(r.repo)}" data-on="${r.on ? '0' : '1'}">${r.on ? 'Tested' : 'Not tested'}</button>` : `<button class="tbtn" data-add="${escHtml(r.repo)}">Make a profile</button>`}</li>`).join('');
     const signIn = cfg.ready
       ? `<p class="ok">GitHub sign-in is set up${cfg.required ? ' and required' : '; it is off while the dashboard listens only on this machine'}.</p>`
       : `<p>Sign-in needs the App's client secret. In <a href="${st.settingsUrl}" target="_blank" rel="noopener">the App's settings</a>: add the callback URL <code>${escHtml(cfg.publicUrl)}/auth/callback</code>, press <b>Generate a new client secret</b>, and paste it here. It is stored in <code>~/.config/miu/github-app.json</code> (only you can read it) and never shown again.</p>
@@ -1453,6 +1472,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (url.pathname === '/api/stats') return json(stats(Math.min(90, Number(url.searchParams.get('days')) || 7)));
+    if (url.pathname === '/github-app/profile') return profilePage(url, res);
     if (url.pathname === '/github-app') return void githubAppPage(res).catch((e) => { res.writeHead(500); res.end(e.message); });
     if (url.pathname === '/github-app/callback') return void githubAppCallback(url, res).catch((e) => { res.writeHead(500); res.end(e.message); });
     let m = url.pathname.match(/^\/api\/runs\/([^/]+)$/);
@@ -1493,6 +1513,7 @@ const server = http.createServer((req, res) => {
         try { auth.saveClientSecret(String(data.secret || '').trim()); return json({ ok: true }); } catch (e) { return json({ error: e.message }); }
       }
       if (url.pathname === '/api/config') { setConfig(data).then(json, (e) => json({ error: e.message })); return; }
+      if (url.pathname === '/api/profiles/save') { try { saveProfile(String(data.repo || ''), String(data.text || '')); return json({ ok: true }); } catch (e) { return json({ error: e.message }); } }
       if (url.pathname === '/api/profiles') { addProfile(String(data.repo || '').trim()).then((p) => json({ ok: true, repo: p.repo }), (e) => json({ error: e.message.replace(/^GitHub GET [^:]+: /, '') })); return; }
       if (url.pathname === '/api/instructions') { try { return json(saveInstruction(RUNS, data)); } catch (e) { return json({ error: e.message }); } }
       // Members (admin; the gate above checks) and one's own password.
@@ -1580,7 +1601,7 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(405); res.end();
 });
-const ADMIN_ONLY = /^\/(api\/config|api\/profiles|api\/instructions|api\/github-user(\/[\w-]+)?|api\/app-secret|api\/connections(\/[\w-]+)?|github-app(\/callback)?)$/;
+const ADMIN_ONLY = /^\/(api\/config|api\/profiles(\/save)?|github-app\/profile|api\/instructions|api\/github-user(\/[\w-]+)?|api\/app-secret|api\/connections(\/[\w-]+)?|github-app(\/callback)?)$/;
 process.on('uncaughtException', (e) => console.error('dashboard error (kept running):', e));
 {
   const cfg = authCfg();

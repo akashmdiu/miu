@@ -2,7 +2,7 @@
 
 Miu tests a repository only if it has a profile: one JSON file per repository in the profiles folder. On a server that folder is `/etc/miu/profiles`. Anywhere else it is `profiles/` in Miu's folder, or the folder `MIU_PROFILES` names.
 
-The quickest way to get one: on the dashboard's **GitHub** page, press **Make a profile**. Miu reads the repository and finds the plugin's main file, the default branch and the test scripts in `composer.json` and `package.json`. Then edit the file to add what it cannot guess.
+The quickest way to get one: on the dashboard's **GitHub** page, press **Make a profile**. Miu reads the repository and finds the plugin's main file, the default branch and the test scripts in `composer.json` and `package.json`. Then press **Edit** beside it to add what it cannot guess. The product notes (`project.md`, below) are under **Settings → Instructions → Product notes**. Both apply from the next run, with no restart.
 
 ## A plugin
 

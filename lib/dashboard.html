@@ -1289,7 +1289,7 @@ function instrPanel() {
     : '<div class="md iprev">' + md(draft ?? cur.text) + '</div>';
   return head + '<div class="instr">' +
     '<nav class="itabs" aria-label="Instruction files">' + tabs + '</nav>' +
-    '<div class="ibar"><span class="tag">' + (cur.edited ? 'Edited' : 'Default') + '</span>' + '<span class="tag warn" id="instr-dirty"' + (dirty ? '' : ' hidden') + '>Not saved</span>' + '<span class="h">' + esc(cur.help) + '</span><span class="sp"></span>' +
+    '<div class="ibar"><span class="tag">' + (cur.own ? 'Yours' : cur.edited ? 'Edited' : 'Default') + '</span>' + '<span class="tag warn" id="instr-dirty"' + (dirty ? '' : ' hidden') + '>Not saved</span>' + '<span class="h">' + esc(cur.help) + '</span><span class="sp"></span>' +
     '<span class="seg"><button class="' + (mode === 'preview' ? 'on' : '') + '" data-instr-mode="preview">Preview</button><button class="' + (mode === 'edit' ? 'on' : '') + '" data-instr-mode="edit">Edit</button></span></div>' +
     body +
     '<div class="acts"><button class="btn primary" data-instr-save' + (dirty ? '' : ' disabled') + '>Save</button>' +
