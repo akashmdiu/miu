@@ -56,3 +56,17 @@ test('a person\'s result label is read as a QA report; Miu\'s own is not', () =>
   assert.equal(qaFrom(node('Ready for Human Testing')).labelReport, null);
   assert.equal(qaFrom(node('Miu Tested & Reported Issue')).labelReport, null);
 });
+
+test('a person\'s later result label marks Miu\'s own result label as replaced', () => {
+  setSignalLabels({});
+  const ev = (name, login, at) => ({ __typename: 'LabeledEvent', createdAt: at, actor: { login }, label: { name } });
+  const node = (events) => ({ comments: { nodes: [] }, commits: { nodes: [] }, timelineItems: { nodes: events } });
+  const later = qaFrom(node([ev('Miu Tested & Reported Issue', 'miu-qa', '2026-11-01T09:06:51Z'), ev('Tested & Ready For Merge', 'shahrear', '2026-11-01T10:21:58Z')]));
+  assert.deepEqual(later.supersededMiu, ['Miu Tested & Reported Issue']);
+  // The person labelled first: Miu's newer result stands.
+  const earlier = qaFrom(node([ev('Tested & Ready For Merge', 'shahrear', '2026-11-01T09:00:00Z'), ev('Ready for Human Testing', 'miu-qa', '2026-11-01T09:50:00Z')]));
+  assert.deepEqual(earlier.supersededMiu, []);
+  // Miu's own old-name label is not a person's result.
+  const own = qaFrom(node([ev('Ready for Human Testing', 'miu-qa', '2026-11-01T06:00:00Z'), ev('Tested & Reported Bugs', 'miu-qa', '2026-11-01T07:00:00Z')]));
+  assert.deepEqual(own.supersededMiu, []);
+});

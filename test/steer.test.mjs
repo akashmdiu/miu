@@ -77,3 +77,10 @@ test('a running Claude agent gets the instruction at its next step, and one sent
   const shown = fs.readFileSync(path.join(d, 'agent-transcript.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.steer);
   assert.deepEqual(shown.map((e) => e.message.content[0].text), ['Also check the mobile menu', 'And the footer']);
 });
+
+test('the agent sees each instruction\'s id, to name it in verdict_rule', async () => {
+  const { message } = await import('../lib/steer.mjs');
+  const m = message([{ id: 's2', by: 'akash', text: 'pass it if no blocker' }]);
+  assert.match(m, /Instruction s2 from akash/);
+  assert.match(m, /verdict_rule/);
+});

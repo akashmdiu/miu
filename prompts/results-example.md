@@ -10,6 +10,7 @@ A filled-in example of every field. Copy its shape; the values are from an old r
   "round": 1,
   "context_line": "Tested Free #812 and Pro #307 together.",
   "verdict_summary": "One paragraph for the full report: the blocker in plain words and the claim it breaks, or what was verified.",
+  "verdict_rule": { "steer": "s1", "allow": "non_blocker" },
   "builds": [{ "label": "Free", "repo": "acme/shop", "pr": 812, "branch": "feat/x", "sha": "…", "version": "1.4.4" }],
   "linked_issues": ["acme/shop-pro#216"],
   "ran": "qa-dev.rex for the before state, qa-pr.rex for combos A, B and B-unlicensed (reset between them), nginx, PHP 8.3. Live OLS not run: not available to automated runs.",

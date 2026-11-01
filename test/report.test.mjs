@@ -226,3 +226,30 @@ test('an untestable claim with no reason, or too many of them, counts as not pro
   assert.equal(many.verdict, 'partial');
   assert.match(many.problems.join('\n'), /more than a run may set aside/);
 });
+
+test('a person\'s "pass if no blocker" turns an unproven or minor-only run into OK, and the comment says whose rule it was', () => {
+  const crit = [
+    { id: 1, claim: 'works', results: { A: { status: 'pass', evidence: ['ev-002'] } } },
+    { id: 2, claim: 'slack', results: { A: { status: 'blocked', note: 'no webhook' } } },
+  ];
+  const minor = [{ severity: 'minor', title: 'old feedback stays', evidence: ['ev-002'] }];
+  assert.equal(judge(base(crit, minor)).verdict, 'partial');
+  const rule = { steer: 's1', allow: 'non_blocker', by: 'akash', text: 'if no blocker then pass it' };
+  const { results, verdict } = judge(base(crit, minor, { verdict_rule: rule }));
+  assert.equal(verdict, 'ok');
+  const body = renderComment(results, verdict, { problems: [] });
+  assert.match(body, /FOUND OK/);
+  assert.match(body, /akash's instruction/);
+  assert.match(body, /old feedback stays/);
+  // A blocker still fails it.
+  assert.equal(judge(base(crit, [{ severity: 'blocker', title: 'b', evidence: ['ev-001', 'ev-002'] }], { verdict_rule: rule })).verdict, 'not_ok');
+  // "unproven" excuses the open claim, not a failed one.
+  assert.equal(judge(base(crit, [], { verdict_rule: { ...rule, allow: 'unproven' } })).verdict, 'ok');
+  assert.equal(judge(base([...crit, { id: 3, claim: 'f', results: { A: { status: 'fail', evidence: ['ev-001', 'ev-002'] } } }], [], { verdict_rule: { ...rule, allow: 'unproven' } })).verdict, 'partial');
+});
+
+test('a rule that changes nothing adds no line', () => {
+  const crit = [{ id: 1, claim: 'works', results: { A: { status: 'pass', evidence: ['ev-002'] } } }];
+  const { results, verdict } = judge(base(crit, [], { verdict_rule: { steer: 's1', allow: 'non_blocker', by: 'akash', text: 'x' } }));
+  assert.doesNotMatch(renderComment(results, verdict, { problems: [] }), /instruction/);
+});

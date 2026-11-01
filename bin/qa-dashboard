@@ -665,8 +665,27 @@ async function pump() {
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
 }
 
+// A person's result label replaced Miu's (lib/prsignals.mjs supersededMiu):
+// take Miu's off, so a PR does not say "Ready For Merge" and "Miu found an
+// issue" at once. Only while Miu posts to GitHub.
+async function tidyLabels() {
+  if (!getConfig().post) return;
+  fetchPrs(); // keeps the signals fresh with auto-test off; this scan uses the last ones
+  const stale = [...signals.entries()].filter(([, q]) => q?.supersededMiu?.length);
+  if (!stale.length) return;
+  const { setLabels } = await import('../lib/publish.mjs');
+  await withAppToken(async () => {
+    for (const [key, q] of stale) {
+      const [repo, n] = key.split('#');
+      const off = q.supersededMiu;
+      try { await setLabels(repo, Number(n), { add: [], remove: off }); q.supersededMiu = []; console.log(`labels ${key}: took off ${off.join(', ')} (a person's result is newer)`); } catch (e) { console.error(`labels ${key}:`, e.message); }
+    }
+  });
+}
+
 // New pull requests and new commits get queued while auto-test is on.
 async function autoScan() {
+  await tidyLabels().catch((e) => console.error('tidy labels:', e.message));
   let cfg = getConfig();
   if (cfg.autoTest && !cfg.baseline) {
     // First start: remember today's heads instead of testing the whole backlog.

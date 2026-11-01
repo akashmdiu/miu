@@ -18,7 +18,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
-import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
+import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells, VERDICT_RULES } from '../lib/report.mjs';
 import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
 import { engineOf, ENGINES } from '../lib/engines.mjs';
@@ -191,7 +191,9 @@ if (!flag('--full')) {
       try { fs.copyFileSync(path.join(prev.dir, 'evidence', row.file), path.join(ev, file)); } catch { continue; }
       if (oldShots[row.file]) carriedShots[file] = oldShots[row.file];
       remap.set(row.id, id);
-      fs.appendFileSync(path.join(ev, 'index.jsonl'), JSON.stringify({ ...row, id, file, label: `round ${prev.round}: ${row.label}`, carried_from: { round: prev.round, sha: prev.sha } }) + '\n');
+      // Evidence carried twice keeps the round that captured it, not "round 2: round 1: …".
+      const from = row.carried_from ?? { round: prev.round, sha: prev.sha };
+      fs.appendFileSync(path.join(ev, 'index.jsonl'), JSON.stringify({ ...row, id, file, label: row.carried_from ? row.label : `round ${from.round}: ${row.label}`, carried_from: from }) + '\n');
     }
     if (Object.keys(carriedShots).length) fs.writeFileSync(path.join(runDir, 'screenshots.carried.json'), JSON.stringify(carriedShots, null, 2));
     const ids = (a) => (a ?? []).map((x) => remap.get(x)).filter(Boolean);
@@ -858,6 +860,28 @@ if (retest && !raw.retest) {
   raw.retest = retest.kind === 'person'
     ? { by: retest.by, sha: retest.sha, summary: `${retest.changed_files.length} file(s) of the PR changed since then; ${(raw.criteria ?? []).length} claim(s) tested again${raw.unchanged?.length ? `, ${raw.unchanged.length} unchanged and not re-tested` : ''}.` }
     : { round: retest.round, sha: retest.sha, summary: `${retest.changed_files.length} file(s) changed in the PR since then; ${(raw.criteria ?? []).length - kept} claim(s) tested again, ${kept} unchanged and carried over.` };
+}
+// The checkouts are Miu's own record (context/builds); a build line the agent
+// left without its branch, PR or commit gets them from there.
+try {
+  const made = fs.readdirSync(path.join(ctx, 'builds')).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(fs.readFileSync(path.join(ctx, 'builds', f), 'utf8')));
+  for (const b of raw.builds ?? []) {
+    const m = made.find((x) => x.sha && b.sha && (x.sha.startsWith(b.sha) || b.sha.startsWith(x.sha))) ?? made.find((x) => x.label === b.label);
+    if (!m) continue;
+    b.repo ??= m.repo; b.sha ??= m.sha; b.version ??= m.version;
+    // A PR checkout's ref is refs/pull/N/head; the report names the PR's branch.
+    const ofPr = [{ repo, number: pr, headRefName: prData.headRefName, headRefOid: sha }, ...pairList].find((x) => x.repo === m.repo && x.headRefOid === m.sha);
+    if (!b.branch) b.branch = ofPr?.headRefName ?? (/^refs\/pull\//.test(m.ref ?? '') ? null : m.ref) ?? undefined;
+    if (!b.pr && ofPr) b.pr = ofPr.number;
+  }
+} catch { /* no builds recorded */ }
+// A looser verdict needs a person's instruction behind it: the agent names
+// one, and only an instruction from the steer files (people, never the agent)
+// counts. lib/report.mjs computeVerdict applies it.
+if (raw.verdict_rule) {
+  const s = steer.list(runDir).find((x) => x.delivered && x.id === raw.verdict_rule.steer);
+  if (s && VERDICT_RULES[raw.verdict_rule.allow]) raw.verdict_rule = { steer: s.id, allow: raw.verdict_rule.allow, by: s.by, text: s.text };
+  else { log(`verdict rule ignored: ${JSON.stringify(raw.verdict_rule).slice(0, 200)}`); delete raw.verdict_rule; }
 }
 const { results, problems } = validate(raw, ledger, runDir);
 // The verdict of the whole run (the full report). In a paired run each PR also
