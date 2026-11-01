@@ -113,6 +113,10 @@ There is no web font to load.
 
 An inlined SVG must keep a unique mask id: the sidebar copy renames `g` to `miu-side`.
 
+## Slack emoji
+
+`assets/brand/slack-emoji/` has 30 emoji drawn from the mark: faces, work badges (LGTM, ship it, bug), the four verdicts and a blinking GIF. Every shape is drawn in `build/slack-emoji.mjs` from the mark's `HEAD`, so the pack changes with the logo and borrows nothing from an emoji font. How to add them to Slack is in [its README](../assets/brand/slack-emoji/README.md).
+
 ## Changing the logo
 
 1. Edit `build/variants.mjs`. Shapes are `HEAD`, `CUT` and `WORD`; the dot art is `CAT` and `TEXT`; each variant is an entry in `variants`.
@@ -121,5 +125,6 @@ An inlined SVG must keep a unique mask id: the sidebar copy renames `g` to `miu-
 4. If the mark changed:
    - rebuild `miu-avatar-512.png` (render `miu-mark-black.svg` at 340 px centred on a 512 px white square)
    - upload it in the GitHub App's settings again
-5. If an inlined copy changed (the sidebar, the favicon), update it in `lib/dashboard.html` too. Those copies are not regenerated on their own.
-6. Copy the result to whoever asked for it. The user keeps a copy in `~/Downloads/miu-logo`.
+5. Rebuild the Slack emoji: `node assets/brand/build/slack-emoji.mjs`.
+6. If an inlined copy changed (the sidebar, the favicon), update it in `lib/dashboard.html` too. Those copies are not regenerated on their own.
+7. Copy the result to whoever asked for it. The user keeps a copy in `~/Downloads/miu-logo`.
