@@ -185,6 +185,7 @@ svg { display: block; }
 .spane { min-width: 0; }
 .settings.one { grid-template-columns: minmax(0, 1fr); }
 .settings.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings + .settings { margin-top: 16px; }
 @media (max-width: 860px) {
   .snav { display: flex; flex-direction: row; gap: 2px; overflow-x: auto; margin: 0 0 14px; padding: 0 0 4px; scrollbar-width: none; }
   .snav a { white-space: nowrap; flex: none; }
@@ -278,6 +279,7 @@ svg { display: block; }
 input.credit { width: 180px; height: 32px; box-sizing: border-box; background: var(--main); border: 1px solid var(--line2); border-radius: 8px; padding: 0 10px; color: var(--ink); font: inherit; font-size: 13px; outline: 0; }
 input.credit:focus { border-color: var(--muted); } input.credit.ok { border-color: var(--ok); }
 input.credit.wide { width: 260px; max-width: 100%; }
+@media (max-width: 600px) { .srow:has(> input.credit.wide) { flex-wrap: wrap; } .srow > input.credit.wide { width: 100%; } }
 .srow.col { flex-wrap: wrap; } .srow.col .st { flex: 1 1 100%; } form.pushtok { display: flex; gap: 8px; width: 100%; } form.pushtok input { flex: 1; width: auto; }
 .linkbtn { background: none; border: 0; padding: 0; color: var(--run); font: inherit; cursor: pointer; }
 .fixcard { border: 1px solid var(--line2); border-radius: 10px; padding: 10px 12px; margin: 0 0 14px; font-size: 13px; }
@@ -300,7 +302,8 @@ input.credit.wide { width: 260px; max-width: 100%; }
 .st b { display: block; font-weight: 500; font-size: 13.5px; color: var(--ink); }
 .st small { display: block; margin-top: 2px; font-size: 12px; line-height: 1.45; color: var(--muted); }
 @media (max-width: 980px) {
-  .settings, .conns { grid-template-columns: minmax(0, 1fr); }
+  /* .settings.two outranks plain .settings, so it is named here too. */
+  .settings, .settings.two, .conns { grid-template-columns: minmax(0, 1fr); }
   .conn + .conn { border-left: 0; border-top: 1px solid var(--line2); }
   .sgroup + .sgroup { border-left: 0; border-top: 1px solid var(--line2); }
 }
@@ -920,7 +923,7 @@ function rulesPanel(cfg) {
     '<span class="rh" title="Open pull requests this rule matches now">' + (dirty ? '' : (hits[i] ?? 0) + ' open') + '</span>' +
     '<span class="ra"><button class="iconbtn" data-rule-move="' + i + ':-1" aria-label="Move up"' + (i ? '' : ' disabled') + '>↑</button><button class="iconbtn" data-rule-move="' + i + ':1" aria-label="Move down"' + (i < ui.rulesDraft.length - 1 ? '' : ' disabled') + '>↓</button><button class="iconbtn" data-rule-del="' + i + '" aria-label="Remove rule">×</button></span></div>').join('');
   const off = !cfg.autoTest;
-  return '<h2 class="shead">Which pull requests to test</h2><p class="ssub">For automatic testing. Rules run top to bottom and the first one that matches decides. Drafts and the Miu Skip label always skip. The Test button, <code>/miu retest</code>, and the Ready For Testing or Needs Re-Test label on a pull request always ask for a test.</p>' +
+  return '<h2 class="shead">Which pull requests to test</h2><p class="ssub">For automatic testing. Rules run top to bottom and the first one that matches decides. Drafts and the ' + esc(labelOf(cfg, 'skip')) + ' label always skip. The Test button, <code>/miu retest</code>, and the ' + esc([...new Set([...(cfg.labels?.request || []), labelOf(cfg, 'retest')])].join(', ')) + ' labels on a pull request always ask for a test.</p>' +
     (off ? '<p class="rulesoff">Automatic testing is off, so these rules are not used yet. Turn it on above.</p>' : '') +
     '<div class="instr rules' + (off ? ' dim' : '') + '">' + (rows || '<p class="h">No rules yet: every pull request is tested.</p>') +
     '<div class="rule last"><button class="btn" data-rule-add>Add rule</button><span class="sp"></span><span class="rw">Everything else</span>' + customSelect({ attrs: 'data-rk="default"', value: ui.ruleDefault, options: RULE_ACTIONS, label: 'Everything else' }) + '</div>' +
@@ -1232,6 +1235,7 @@ function renderSettings(force) {
         rules: () =>
     '<p class="ssub">Whether Miu picks up pull requests on its own.</p><div class="settings one"><div class="sgroup">' +
     srow({ cfg: 'autoTest', on: cfg.autoTest, title: 'Test new pull requests automatically', help: cfg.autoTest ? 'New pull requests and new commits, one at a time.' + (backlog ? ' The ' + backlog + ' open before only when you press Test.' : '') : 'Nothing runs on its own; press Test on a pull request.' }) +
+    srow({ cfg: 'testConflicts', on: cfg.testConflicts, title: 'Test pull requests with merge conflicts', help: cfg.testConflicts ? 'Miu tests the branch as it is. The result may change once the conflicts are resolved.' : 'Miu asks the author to resolve the conflicts and tests the next commit.' }) +
     '</div></div>' + rulesPanel(cfg),
       }[tab]();
       return '<h2 class="shead">AI &amp; agents</h2>' +
@@ -1241,7 +1245,7 @@ function renderSettings(force) {
     },
     github: () => '<h2 class="shead">GitHub and notices</h2><p class="ssub">What Miu writes on the pull request, and who hears when a test ends.</p><div class="settings two">' +
     '<div class="sgroup"><h3>On GitHub</h3>' +
-    srow({ cfg: 'post', on: cfg.post, title: 'Post the report and update labels', help: cfg.post ? 'A comment on the pull request, and Test Ongoing moves to Tested & Ready For Merge or Tested & Reported Bugs.' : 'Results stay here; nothing is posted and no labels change.' }) +
+    srow({ cfg: 'post', on: cfg.post, title: 'Post the report and update labels', help: cfg.post ? 'A comment on the pull request, and ' + labelOf(cfg, 'ongoing') + ' moves to ' + labelOf(cfg, 'miuOk') + ' or ' + labelOf(cfg, 'miuBugs') + '.' : 'Results stay here; nothing is posted and no labels change.' }) +
     srow({ cfg: 'commands', on: cfg.commands, title: 'Answer <code>/miu retest</code>', html: true, help: 'Team members can ask for a test in a pull request comment.' }) +
     shotsRow() +
     collabRow() +
@@ -1249,7 +1253,7 @@ function renderSettings(force) {
     '<div class="sgroup"><h3>Notices</h3>' +
     (MIU.slack ? srow({ cfg: 'slack', on: cfg.slack, disabled: !cfg.post, title: 'Tell #' + esc(String(MIU.slack).replace(/^#/, '')) + ' on Slack', help: cfg.post ? 'One line when a report is posted.' : 'Needs posting on GitHub turned on.' }) : '') +
     srow({ local: 'notify', on: store.get('qa-notify', false), title: 'Notify me on this computer', help: 'A desktop notice when a test ends.' }) +
-    '</div></div>',
+    '</div></div>' + labelsPanel(cfg),
     instructions: instrPanel,
     members: membersPanel,
     account: accountPanel,
@@ -1365,6 +1369,29 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   e.preventDefault();
   saveFix({ authors: [...(ui.prs?.config?.fix?.authors || []), b.dataset.fixAddme] });
+});
+
+// Settings → GitHub and notices → Labels: the name of each QA label by role
+// (lib/labels.mjs). A role that takes several names splits them on commas.
+const labelOf = (cfg, k) => { const v = cfg?.labels?.[k]; return Array.isArray(v) ? v.join(', ') : (v || ''); };
+function labelsPanel(cfg) {
+  const roles = Object.entries(ui.prs?.labelRoles || {});
+  if (!roles.length) return '';
+  return '<div class="settings one"><div class="sgroup"><h3>Labels</h3>' +
+    '<p class="h">The pull request labels Miu reads and puts on. Each must exist in the repos.</p>' +
+    roles.map(([k, r]) => '<div class="srow"><span class="st"><b>' + esc(r.title) + '</b><small>' + esc(r.help) + (r.list ? ' Separate several with commas.' : '') + '</small></span>' +
+      '<input class="credit wide" data-label-role="' + esc(k) + '" value="' + esc(labelOf(cfg, k)) + '" spellcheck="false" autocomplete="off" aria-label="' + esc(r.title) + '"></div>').join('') +
+    '</div></div>';
+}
+document.addEventListener('change', async (e) => {
+  const k = e.target.dataset?.labelRole;
+  if (!k) return;
+  const el = e.target;
+  const r = await post('/api/config', { labels: { [k]: el.value } });
+  if (r.error) { tell('Not saved', r.error); ui.key = ''; return tick(); }
+  if (ui.prs) ui.prs.config = { ...ui.prs.config, labels: r.labels };
+  el.classList.add('ok'); setTimeout(() => el.classList.remove('ok'), 1500);
+  ui.key = ''; tick();
 });
 
 function srow({ cfg, local, on, title, help, disabled = false, html = false }) {
@@ -2039,7 +2066,7 @@ document.addEventListener('change', async (e) => {
   const c = e.target.dataset?.cfg;
   if (c) {
     const value = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
-    if (c === 'post' && value && !(await ask({ title: 'Post reports on pull requests?', body: 'From now on, each finished test posts its full report as a comment on the pull request and changes its labels (Test Ongoing, then Tested & Ready For Merge or Tested & Reported Bugs).', ok: 'Turn on' }))) { e.target.checked = false; return; }
+    if (c === 'post' && value && !(await ask({ title: 'Post reports on pull requests?', body: 'From now on, each finished test posts its full report as a comment on the pull request and changes its labels (' + labelOf(ui.prs?.config, 'ongoing') + ', then ' + labelOf(ui.prs?.config, 'miuOk') + ' or ' + labelOf(ui.prs?.config, 'miuBugs') + ').', ok: 'Turn on' }))) { e.target.checked = false; return; }
     await post('/api/config', { [c]: value });
     return refreshPrs();
   }

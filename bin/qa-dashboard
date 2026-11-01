@@ -13,7 +13,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { screenshots, validate, loadLedger } from '../lib/report.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { postRun } from '../lib/postrun.mjs';
-import { qaSignals, prHistory } from '../lib/prsignals.mjs';
+import { qaSignals, prHistory, setLabelNames as setSignalLabels } from '../lib/prsignals.mjs';
 import { partnersOf, roleOf } from '../lib/pairs.mjs';
 import { project, profiles, roles } from '../lib/project.mjs';
 import { addProfile, saveProfile, profileText } from '../lib/newprofile.mjs';
@@ -26,7 +26,8 @@ import * as ghuser from '../lib/ghuser.mjs';
 import * as prRules from '../lib/prrules.mjs';
 import { refusal } from '../lib/authrefused.mjs';
 import * as users from '../lib/users.mjs';
-import { cloudinaryUrl } from '../lib/publish.mjs';
+import { cloudinaryUrl, setLabelNames as setPublishLabels } from '../lib/publish.mjs';
+import { labelNames, cleanPatch as cleanLabels, ROLES as LABEL_ROLES } from '../lib/labels.mjs';
 import * as gh from '../lib/github.mjs';
 import * as fixLib from '../lib/fix.mjs';
 import * as steer from '../lib/steer.mjs';
@@ -378,8 +379,14 @@ const CONFIG_FILE = path.join(RUNS, '.config.json');
 // PR whose head moves past it (a new PR or a new push) is tested on its own;
 // the backlog that was already open is tested only when someone asks.
 // connections: how each engine is reached, plan | api | off (lib/connections.mjs).
-const DEFAULTS = { autoTest: true, model: MODELS[0].id, post: false, slack: false, commands: true, baseline: null, repos: null, connections: conn.DEFAULT_MODES, effort: 'default', credit: '', rules: [], ruleDefault: 'test', fix: { on: false, authors: [], model: 'same', effort: 'same' } };
-const getConfig = () => { const c = { ...DEFAULTS, ...(readJson(CONFIG_FILE) ?? {}) }; c.connections = { ...conn.DEFAULT_MODES, ...c.connections }; c.fix = { ...DEFAULTS.fix, ...c.fix }; return c; };
+const DEFAULTS = { autoTest: true, model: MODELS[0].id, post: false, slack: false, commands: true, testConflicts: false, baseline: null, repos: null, connections: conn.DEFAULT_MODES, effort: 'default', credit: '', rules: [], ruleDefault: 'test', fix: { on: false, authors: [], model: 'same', effort: 'same' }, labels: {} };
+const getConfig = () => { const c = { ...DEFAULTS, ...(readJson(CONFIG_FILE) ?? {}) }; c.connections = { ...conn.DEFAULT_MODES, ...c.connections }; c.fix = { ...DEFAULTS.fix, ...c.fix }; c.labels = labelNames(c.labels); return c; };
+// The label names by role (Settings → GitHub and notices), in this process and
+// in the GitHub signal reader. A run gets them with --labels.
+let labelsNow = null;
+const L = () => labelsNow;
+const useLabels = (saved) => { labelsNow = labelNames(saved); setPublishLabels(saved); setSignalLabels(saved); };
+useLabels(readJson(CONFIG_FILE)?.labels);
 // Models of engines that are not turned off.
 // "Auto": the model and effort are picked per pull request after triage
 // (lib/autopick.mjs), on the engine that is connected (Claude first).
@@ -403,7 +410,7 @@ async function setConfig(patch) {
     if (patch.autoTest && !next.autoTest) next.baseline = await snapshotHeads();
     next.autoTest = patch.autoTest;
   }
-  for (const k of ['post', 'slack', 'commands']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
+  for (const k of ['post', 'slack', 'commands', 'testConflicts']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
   // Turn one repo on or off; only repos with a test profile can be on.
   if (gh.validRepo(patch.repo) && typeof patch.on === 'boolean' && profiled().has(patch.repo)) {
     const cur = new Set(Array.isArray(next.repos) ? next.repos : [...profiled().keys()]);
@@ -426,6 +433,7 @@ async function setConfig(patch) {
     }
     next.fix = f;
   }
+  if (patch.labels !== undefined) next.labels = { ...next.labels, ...cleanLabels(patch.labels) };
   if (patch.rules !== undefined) next.rules = prRules.cleanRules(patch.rules);
   if (['test', 'skip'].includes(patch.ruleDefault)) next.ruleDefault = patch.ruleDefault;
   if (EFFORTS.some((x) => x.id === patch.effort)) next.effort = patch.effort;
@@ -442,6 +450,7 @@ async function setConfig(patch) {
   }
   fs.mkdirSync(RUNS, { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2));
+  if (patch.labels !== undefined) useLabels(next.labels);
   return next;
 }
 
@@ -514,7 +523,7 @@ const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queu
 // rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.
 const skipReason = (p) => {
   if (p.isDraft) return 'Draft';
-  if (p.labels.includes('Miu Skip')) return 'Labelled Miu Skip';
+  if (p.labels.includes(L().skip)) return `Labelled ${L().skip}`;
   if (p.labels.includes('qa:skip')) return 'Labelled qa:skip';
   const cfg = getConfig();
   const d = prRules.decide(cfg.rules ?? [], cfg.ruleDefault ?? 'test', p);
@@ -531,6 +540,7 @@ function prView() {
   return {
     // How many open PRs each rule matches now, for the Settings page.
     ruleHits: (getConfig().rules ?? []).map((r) => list.filter((p) => prRules.matches(r, p)).length),
+    labelRoles: LABEL_ROLES,
     error, fetchedAt: at, config: (({ baseline, ...c }) => c)(getConfig()), queue: queue.map((q) => `${q.repo}#${q.pr}`), queueHeld, disk: diskState(), queueFull: queue.filter((q) => q.full).map((q) => `${q.repo}#${q.pr}`),
     prs: list.map((p) => {
       const all = runs.get(`${p.repo}#${p.number}`) ?? [];
@@ -543,14 +553,14 @@ function prView() {
       // or "Needs Re-Test": it needs testing again. "Test Ongoing" without a
       // Miu run: a person is testing it now.
       const qa = signals.get(`${p.repo}#${p.number}`) ?? null;
-      // "Test Ongoing" that Miu itself put on, with no run of it going, is a
+      // A "testing now" label Miu itself put on, with no run of it going, is a
       // leftover (a crashed run), not a person testing.
-      const personTesting = p.labels.includes('Test Ongoing') && atHead?.state !== 'running' && !/miu/i.test(qa?.ongoingBy ?? '');
+      const personTesting = p.labels.includes(L().ongoing) && atHead?.state !== 'running' && !/miu/i.test(qa?.ongoingBy ?? '');
       const miuLabel = (r) => !!r && all.some((x) => x.postedAt && Math.abs(Date.parse(x.postedAt) - Date.parse(r.at)) < 5 * 60 * 1000);
       const personLabel = qa?.labelReport && !miuLabel(qa.labelReport) ? qa.labelReport : null;
       const signalsBy = [qa?.lastPerson && { ...qa.lastPerson, stale: qa.newCommitsSincePerson }, personLabel && { ...personLabel, stale: qa.newCommitsSinceLabel }].filter(Boolean);
       const lastSignal = signalsBy.sort((x, y) => Date.parse(x.at) - Date.parse(y.at)).at(-1) ?? null;
-      const needsRetestLabel = p.labels.includes('Needs Re-Test') && !(lastSignal && !lastSignal.stale && lastSignal.kind === 'label');
+      const needsRetestLabel = p.labels.includes(L().retest) && !(lastSignal && !lastSignal.stale && lastSignal.kind === 'label');
       let state = 'untested', why = null;
       if (skipReason(p)) state = 'skipped';
       // A paired run is one test: the PR whose run it is shows it running; the
@@ -558,7 +568,7 @@ function prView() {
       else if (atHead?.state === 'running' && atHead.via) { state = 'in_pair'; why = (atHead.pairOthers ?? []).find((o) => o.key === atHead.via)?.label ?? atHead.via; }
       else if (atHead?.state === 'running') state = 'running';
       else if (queue.some((q) => q.repo === p.repo && q.pr === p.number)) state = 'queued';
-      else if (personTesting) { state = 'person_testing'; why = qa?.ongoingBy ? `${qa.ongoingBy} is testing it` : 'Test Ongoing'; }
+      else if (personTesting) { state = 'person_testing'; why = qa?.ongoingBy ? `${qa.ongoingBy} is testing it` : L().ongoing; }
       // The newest run did not start testing: say what it waits for, and the
       // last result this commit got, if any.
       else if (atHead?.state === 'waiting') {
@@ -577,7 +587,7 @@ function prView() {
       else if (needsRetestLabel || (lastSignal && lastSignal.stale) || (qa?.last && qa.newCommitsSince)) {
         state = 'retest';
         const src = lastSignal ?? (qa?.last ? { by: qa.last.kind === 'miu' ? 'Miu' : qa.last.by, kind: 'comment', verdict: qa.last.verdict } : null);
-        why = needsRetestLabel && !(lastSignal?.stale) ? 'Needs Re-Test' : src ? `new commits since ${src.by}'s ${src.kind === 'label' ? `"${src.label}"` : `report (${src.verdict})`}` : 'Needs Re-Test';
+        why = needsRetestLabel && !(lastSignal?.stale) ? L().retest : src ? `new commits since ${src.by}'s ${src.kind === 'label' ? `"${src.label}"` : `report (${src.verdict})`}` : L().retest;
       }
       else if (latest) state = 'stale';
       return {
@@ -587,7 +597,7 @@ function prView() {
         run: atHead ?? latest, runs: all.length, live: live && atHead?.name === live,
         fix: fixes.find((f) => f.repo === p.repo && f.pr === p.number) ?? null,
         why, pair: ((atHead ?? latest)?.pairOthers ?? []).map((o) => o.label),
-        qa: qa && { last: qa.last, lastPerson: lastSignal ?? qa.lastPerson, newCommitsSince: qa.newCommitsSince, ongoingBy: p.labels.includes('Test Ongoing') ? qa.ongoingBy : null },
+        qa: qa && { last: qa.last, lastPerson: lastSignal ?? qa.lastPerson, newCommitsSince: qa.newCommitsSince, ongoingBy: p.labels.includes(L().ongoing) ? qa.ongoingBy : null },
       };
     }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
   };
@@ -669,27 +679,28 @@ async function autoScan() {
     const runs = runsByPr();
     const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
     for (const p of list) {
-      // "Ready For Testing" or "Needs Re-Test" on a PR is a request, like
+      // A request label (Settings) or the retest label on a PR asks, like
       // /miu retest: taken whatever was tested before or open before
       // auto-test. Miu takes the label off when it starts, so it being back
-      // asks again. A draft or Miu Skip still wins; a run of this PR in the
+      // asks again. A draft or the skip label still wins; a run of this PR in the
       // last 30 minutes means the label did not come off, so no loop.
-      if (p.isDraft || p.labels.includes('Miu Skip') || p.labels.includes('qa:skip')) continue;
-      if (p.labels.some((l) => l === 'Ready For Testing' || l === 'Needs Re-Test')) {
+      const asks = [...L().request, L().retest];
+      if (p.isDraft || p.labels.includes(L().skip) || p.labels.includes('qa:skip')) continue;
+      if (p.labels.some((l) => asks.includes(l))) {
         const recent = (runs.get(`${p.repo}#${p.number}`) ?? []).some((r) => Date.now() - (Date.parse(r.startedAt ?? 0) || r.mtime) < 30 * 60 * 1000);
         const busy = queue.some((q) => q.repo === p.repo && q.pr === p.number) || liveRun()?.startsWith(`${p.repo.split('/')[1]}-${p.number}-`);
         // The label comes back when a run ends with no result. Two of those on
         // this commit is enough: a new commit, or a person, asks again.
         const empty = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((r) => r.sha === p.headRefOid && ['no_result', 'inconclusive'].includes(r.verdict)).length;
         if (empty >= 2) continue;
-        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => l === 'Ready For Testing' || l === 'Needs Re-Test')}`);
+        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`);
         continue;
       }
       if (skipReason(p)) continue;
       if (cfg.baseline[`${p.repo}#${p.number}`] === p.headRefOid) continue;
       // A person is on it, or already tested this commit: do not test twice.
       const qa = signals.get(`${p.repo}#${p.number}`);
-      if (p.labels.includes('Test Ongoing') && !liveRun()?.startsWith(`${p.repo.split('/')[1]}-${p.number}-`)) continue;
+      if (p.labels.includes(L().ongoing) && !liveRun()?.startsWith(`${p.repo.split('/')[1]}-${p.number}-`)) continue;
       if (qa?.lastPerson && !qa.newCommitsSincePerson) continue;
       if (qa?.labelReport && !qa.newCommitsSinceLabel) continue;
       // A run stopped by a person does not count as tested. One that died on
@@ -700,8 +711,11 @@ async function autoScan() {
       // an hour later, in case what it waited for (a build, a sign-in) is fixed.
       const empty = forSha.filter((r) => ['no_result', 'inconclusive'].includes(r.verdict));
       const waitedLong = (r) => r.state === 'waiting' && Date.now() - Date.parse(r.waiting?.at ?? 0) > 60 * 60 * 1000;
+      // With "Test pull requests with merge conflicts" on, a run that stopped
+      // at a conflict is not a test of this commit.
+      const skippedConflict = (r) => cfg.testConflicts && r.state === 'conflict' && r.conflictKind === 'conflict';
       const mine = forSha.filter((r) => (r.state !== 'stopped' || (r.crashed && crashed.length >= 2))
-        && !(empty.includes(r) && empty.length < 2) && !waitedLong(r));
+        && !(empty.includes(r) && empty.length < 2) && !waitedLong(r) && !skippedConflict(r));
       const tested = mine.some((r) => r.state === 'running' || !pairMoved(r, heads).length);
       if (!tested) await enqueuePair(p.repo, p.number, mine.length ? 'a paired PR changed' : 'new commits');
     }
@@ -819,6 +833,8 @@ function startRun({ repo, pr, model, dryRun, full, force, note, slack }) {
   if (force) args.push('--force');
   if (note) args.push('--note', String(note).slice(0, 500));
   if (slack) args.push('--slack');
+  args.push('--labels', JSON.stringify(L()));
+  if (getConfig().testConflicts) args.push('--test-conflicts');
   const child = spawn(process.execPath, args, { cwd: ROOT, detached: true, stdio: ['ignore', out, out] });
   child.on('error', (e) => console.error('could not start qa-run:', e.message));
   child.unref();
@@ -933,7 +949,7 @@ async function fixScan() {
   const authors = new Set(cfg.fix.authors.map((a) => a.toLowerCase()));
   const runs = runsByPr();
   for (const p of fetchPrs().list) {
-    if (!authors.has(String(p.author?.login ?? '').toLowerCase()) || p.isDraft || p.labels.includes('Miu Skip')) continue;
+    if (!authors.has(String(p.author?.login ?? '').toLowerCase()) || p.isDraft || p.labels.includes(L().skip)) continue;
     // The PR's own run (a paired run is fixed through each PR's own), newest first.
     const r = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((x) => !x.via && x.sha === p.headRefOid && x.state === 'done')
       .sort((a, b) => (Date.parse(b.startedAt ?? 0) || b.mtime) - (Date.parse(a.startedAt ?? 0) || a.mtime))[0];

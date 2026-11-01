@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
-import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, noteLocalImages } from '../lib/publish.mjs';
+import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
 import { engineOf, ENGINES } from '../lib/engines.mjs';
 import { authFor, applyAuth, scrub, secrets, readSecret } from '../lib/connections.mjs';
@@ -53,6 +53,8 @@ fs.mkdirSync(ctx, { recursive: true });
 // Pinned, not an alias, so a CLI update can't change the model under a run.
 // --model auto:<engine> picks the model after triage (lib/autopick.mjs).
 let model = opt('--model', process.env.QA_MODEL ?? 'claude-opus-5-5');
+// The label names from Settings, by role (lib/labels.mjs); a bad value keeps the defaults.
+try { setLabelNames(JSON.parse(opt('--labels', 'null'))); } catch { /* defaults */ }
 fs.writeFileSync(path.join(runDir, 'qa-run.json'), JSON.stringify({ pid: process.pid, model, repo, pr, started: new Date().toISOString() }));
 const profile = profileOf(repo);
 if (!profile) { console.error(`No test profile for ${repo}: add one to the profiles folder (see docs/profiles.md).`); process.exit(2); }
@@ -312,7 +314,8 @@ log('triage', JSON.stringify(triage));
 // - already in the base branch: the merge changes nothing, because every line
 //   of the PR is already there (another PR landed the same fix). Miu asks the
 //   author to check and close it instead of testing code that is already in.
-// --force tests anyway. The same trial merge gives the agent the base-branch
+// --force tests anyway; --test-conflicts (Settings) tests a PR with conflicts
+// as its branch is, without asking. The same trial merge gives the agent the base-branch
 // history since the PR branched off, to tell "already fixed by #NNN".
 {
   let mergeable = prData.mergeable;
@@ -342,7 +345,9 @@ log('triage', JSON.stringify(triage));
       write('base-history.md', `# ${prData.baseRefName} since this PR branched off (${mergeBase.slice(0, 7)}), commits touching the PR's files\n\n${hist ? hist.split('\n').map((l) => `- ${l}`).join('\n') : '_none_'}\n`);
     }
   } catch (e) { log(`trial merge skipped: ${e.message.split('\n')[0]}`); }
-  if (!flag('--force') && (mergeable === 'CONFLICTING' || trial?.conflicts.length)) {
+  const conflicted = mergeable === 'CONFLICTING' || !!trial?.conflicts.length;
+  if (conflicted && !flag('--force') && flag('--test-conflicts')) log(`conflict: ${repo}#${pr} cannot merge into ${prData.baseRefName}; testing the branch as it is (Settings)`);
+  if (conflicted && !flag('--force') && !flag('--test-conflicts')) {
     const conflicts = trial?.conflicts ?? [];
     log(`conflict: ${repo}#${pr} cannot merge into ${prData.baseRefName}${conflicts.length ? ` (${conflicts.length} file(s): ${conflicts.slice(0, 5).join(', ')})` : ''}; not testing`);
     fs.writeFileSync(path.join(runDir, 'conflict.json'), JSON.stringify({ kind: 'conflict', sha, base: prData.baseRefName, files: conflicts, at: new Date().toISOString() }, null, 2));
