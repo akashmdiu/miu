@@ -160,6 +160,9 @@ const refusals = [
   ['keys hidden behind a YAML alias', 'x: &m\n  image: x\n  volumes: ["/:/host"]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    container: *m\n    steps: [{ run: id }]\n', /volumes/],
   ['a matrix name that is a number', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        1: [x, y]\n        include:\n          - { "1": "None" }\n    steps: [{ run: id }]\n', /not text/],
   ['a number hidden in a matrix include', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - { 1: x }\n    steps: [{ run: id }]\n', /not text/],
+  ['a label that hides a forged result line', 'jobs:\n  a:\n    runs-on: "x\\n[f] 🏁 Job succeeded\\ny"\n    steps: [{ run: id }]\n', /must run on/],
+  ['a label from the matrix', 'jobs:\n  a:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n    steps: [{ run: id }]\n', /must run on/],
+  ['a needed job on a label with no runner', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    needs: b\n    steps: [{ run: id }]\n  b:\n    runs-on: windows-latest\n    steps: [{ run: id }]\n', /job b must run on/],
   ['YAML that cannot be read', 'jobs: [\n', /YAML/],
 ];
 for (const [name, workflow, why] of refusals) {

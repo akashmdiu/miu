@@ -54,7 +54,7 @@ bounded 300 tar -x -C "$root"
 # Miu's account runs pull request code in its fast checks, so it can call this
 # script with any tar. Before act sees the workflow, check what it asks of Docker.
 if [ -n "$(find "$root/.github" -type l -print -quit)" ]; then die "refused: a symbolic link under .github"; fi
-bounded 60 python3 -I - "$root/$workflow" <<'POLICY'
+bounded 60 python3 -I - "$root/$workflow" "$job" <<'POLICY'
 import os, shlex, sys
 import yaml
 
@@ -111,6 +111,19 @@ for job_id, job in jobs.items():
             refuse(f"job {job_id} services must be a mapping")
         for service_id, service in services.items():
             check(f"service {service_id}", service)
+
+# act skips a job on a label with no runner and exits 0, and quotes the label in
+# its log. The job that runs, and what it needs, must be on a label Sandbox maps.
+seen, todo = set(), [sys.argv[2]]
+while todo:
+    job_id = todo.pop()
+    if job_id in seen or job_id not in jobs:
+        continue
+    seen.add(job_id)
+    if jobs[job_id].get("runs-on") not in ("ubuntu-latest", "ubuntu-22.04"):
+        refuse(f"job {job_id} must run on ubuntu-latest or ubuntu-22.04")
+    needs = jobs[job_id].get("needs") or []
+    todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
 POLICY
 
 # act runs on this server and reads these from the folder it runs in. .actrc is
