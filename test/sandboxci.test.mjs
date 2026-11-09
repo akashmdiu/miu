@@ -55,7 +55,7 @@ function fakeWorker({ stdout = '', stderr = '', exit = 0, sleep = 0, ignoreTerm 
 }
 
 // The real worker, with a stand-in `sb` that keeps what it was given.
-function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"Job succeeded"}]}', plan = '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}' } = {}) {
+function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"[t/a]   🏁  Job succeeded"}]}', plan = '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}' } = {}) {
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
@@ -66,7 +66,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
 const report = (cells) => JSON.stringify({ ok: cells.every((c) => c.status === 'passed'), cells }) + '\n';
 
 test('goes through the one sudo rule, as the configured account', async () => {
-  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: 'Job succeeded' }]) });
+  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a]   🏁  Job succeeded' }]) });
   const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', job: 'php', matrix: { php: 8.3, db: 'mysql' }, event: 'push', timeout_minutes: 5 } }, repo(), s.env);
   assert.equal(r.status, 0);
   assert.deepEqual(s.sudoArgv().slice(0, 4), ['-n', '-H', '-u', 'ubuntu']);
@@ -75,7 +75,7 @@ test('goes through the one sudo rule, as the configured account', async () => {
 });
 
 test('defaults: a pull request, 30 minutes', async () => {
-  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: 'Job succeeded' }]) });
+  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a]   🏁  Job succeeded' }]) });
   await runSandboxCi(check, repo(), s.env);
   assert.deepEqual(s.argv(), ['.github/workflows/test.yml', 'pull_request', '1800', 'a']);
 });
@@ -221,8 +221,8 @@ test('the worker refuses arguments Miu would never send', () => {
 
 test('a job that fails is a failure, with the output of what failed', async () => {
   const s = fakeWorker({ exit: 1, stdout: report([
-    { label: 'good', status: 'passed', exit_code: 0, output: 'all fine\nJob succeeded' },
-    { label: 'bad', matrix: { php: '8.1' }, status: 'failed', exit_code: 1, output: 'PHPUnit: 2 failures\nJob failed' },
+    { label: 'good', status: 'passed', exit_code: 0, output: 'all fine\n[t/a]   🏁  Job succeeded' },
+    { label: 'bad', matrix: { php: '8.1' }, status: 'failed', exit_code: 1, output: 'PHPUnit: 2 failures\n[t/bad]   🏁  Job failed' },
   ]) });
   const r = await runSandboxCi(check, repo(), s.env);
   assert.equal(r.status, 1);
@@ -233,7 +233,7 @@ test('a job that fails is a failure, with the output of what failed', async () =
 
 test('a real failure is reported even when another cell could not start', async () => {
   const s = fakeWorker({ exit: 1, stdout: report([
-    { label: 'bad', status: 'failed', exit_code: 2, output: 'assertion\nJob failed' },
+    { label: 'bad', status: 'failed', exit_code: 2, output: 'assertion\n[t/bad]   🏁  Job failed' },
     { label: 'down', status: 'provision_failed', error: 'no port' },
   ]) });
   assert.equal((await runSandboxCi(check, repo(), s.env)).status, 1);
@@ -244,6 +244,8 @@ for (const [name, sb, expected] of [
   ['a cell that could not start', { exit: 1, stdout: report([{ label: 'a', status: 'provision_failed', error: 'no port left' }]) }, /no port left/],
   ['act failing before the job ran', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: 'Error: No such image: catthehacker/ubuntu:act-22.04' }]) }, /No such image/],
   ['act exiting 0 without running a job', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: 'nothing selected' }]) }, /no job ran/],
+  ['a skipped job whose label says it succeeded', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a] 🚧  Skipping unsupported platform -- Try running with -P Job succeeded=image' }]) }, /no job ran/],
+  ['a step that prints the failure line', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: '[t/a]   | 🏁  Job failed\nError: No such image' }]) }, /No such image/],
   ['a cell that timed out', { exit: 1, stdout: report([{ label: 'a', status: 'failed', error: 'timed out after 900s' }]) }, /timed out/],
   ['a run with no cells', { stdout: report([]) }, /no jobs/i],
   ['a CLI that dies before running anything', { exit: 1, stderr: 'act not found\n' }, /act not found/],
@@ -258,7 +260,7 @@ for (const [name, sb, expected] of [
 }
 
 test('finds the report after anything else the CLI prints', async () => {
-  const s = fakeWorker({ stdout: `notice: running locally\n${report([{ label: 'a', status: 'passed', exit_code: 0, output: 'Job succeeded' }])}` });
+  const s = fakeWorker({ stdout: `notice: running locally\n${report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a]   🏁  Job succeeded' }])}` });
   assert.equal((await runSandboxCi(check, repo(), s.env)).status, 0);
 });
 
