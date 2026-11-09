@@ -45,6 +45,32 @@ The quickest way to get one: on the dashboard's **GitHub** page, press **Make a 
 | `cross_repo` | Optional. What the agent should check across repositories, in words. |
 | `not_in_ci` | Optional. Things the QA machine cannot cover. The report lists them as not covered. |
 
+## A CI workflow as a fast check
+
+A fast check can run one of the repository's GitHub Actions workflows instead of a command. Miu runs it with Sandbox on its own server, so the server has to be set up first ([install.md](install.md#ci-workflows-through-sandbox)).
+
+```json
+{
+  "label": "CI",
+  "when": "\\.php$",
+  "sandbox_ci": {
+    "workflow": ".github/workflows/test.yml",
+    "jobs": ["phpunit"],
+    "timeout_minutes": 30
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `workflow` | The workflow file, directly in `.github/workflows`. Required. |
+| `jobs` | Which job ids to run. The default is every job. |
+| `event` | The GitHub event the run simulates. The default is `pull_request`. |
+| `runtime` | `none` runs the workflow alone (the default). `sandbox` also starts a WordPress site for each matrix cell, at `WP_BASE_URL`; the repository needs a `sandbox.config.json` for that. |
+| `timeout_minutes` | The time limit, 1 to 240. The default is 30. |
+
+The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/`, `.actrc` or `sandbox.config*`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped.
+
 ## A plugin and its add-on
 
 Give the add-on its own profile with `"role": "addon"`, and point each profile at the other with `sibling`:

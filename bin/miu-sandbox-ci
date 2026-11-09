@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Run one GitHub Actions workflow with the Sandbox CLI on this server.
+#
+# Installed as /usr/local/lib/miu/sandbox-ci. It runs as the account that owns
+# Sandbox, through the one sudo rule install.sh --sandbox-user adds, because
+# Miu's own account has no Docker access. The pull request's files arrive as a
+# tar on stdin, so that account never reads Miu's folders.
+#
+#   sandbox-ci <workflow> <event> <timeout-seconds> <none|sandbox> [job...]
+#
+# Prints the JSON report of `sb ci run` on stdout.
+set -euo pipefail
+
+die() { echo "$*" >&2; exit 2; }
+[ $# -ge 4 ] || die "usage: sandbox-ci <workflow> <event> <timeout-seconds> <none|sandbox> [job...]"
+workflow=$1 event=$2 seconds=$3 runtime=$4
+shift 4
+
+[[ $workflow =~ ^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$ ]] || die "not a workflow path: $workflow"
+[[ $event =~ ^[a-z_]{1,64}$ ]] || die "not an event name: $event"
+[[ $seconds =~ ^[0-9]{1,5}$ ]] || die "not a timeout: $seconds"
+case "$runtime" in none|sandbox) ;; *) die "not a runtime: $runtime" ;; esac
+job_args=()
+for job in "$@"; do
+  [[ $job =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "not a job id: $job"
+  job_args+=(--job "$job")
+done
+
+sb="$HOME/sandbox/sb-src/sb"
+[ -x "$sb" ] || die "no Sandbox CLI at $sb"
+
+root=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci.XXXXXX")
+config=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci-config.XXXXXX")
+cleanup() {
+  # Jobs run as root in their containers, so what they wrote needs root to remove.
+  docker run --rm --pull=never -v "$root:/work" --entrypoint find catthehacker/ubuntu:act-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
+  rm -rf "$root" "$config" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+tar -x -C "$root"
+[ -f "$root/$workflow" ] || die "the pull request has no $workflow"
+if [ "$runtime" = sandbox ] && [ ! -f "$root/sandbox.config.json" ]; then
+  die "runtime sandbox needs a sandbox.config.json in the repository"
+fi
+# act takes options from .actrc in the folder it runs in; these files are the
+# pull request's. Its own settings say to keep the Docker socket out of jobs:
+# with the socket a job could start a container that owns this server.
+rm -f "$root/.actrc"
+mkdir "$config/act"
+echo '--container-daemon-socket=-' > "$config/act/actrc"
+export XDG_CONFIG_HOME="$config"
+
+# Workflows expect a git checkout; an archive has none.
+git -C "$root" init -q
+git -C "$root" add -A
+git -C "$root" -c user.name=miu -c user.email=miu@localhost commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
+
+# Inside this script, because Miu's account cannot signal this one to stop it.
+timeout -k 30 "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
+  --event "$event" --timeout "$seconds" --runtime "$runtime" ${job_args[@]+"${job_args[@]}"}
