@@ -8,6 +8,8 @@ import { createWorkerLauncher } from '../lib/management-launcher.mjs';
 const allowedEnvironment = [
   'PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'MIU_PROFILES',
   'MIU_AGENT_USER', 'MIU_AGENT_REX', 'MIU_AGENT_EXEC', 'MIU_AGENT_BASE_PATH',
+  'MIU_AGENT_LIB', 'MIU_AGENT_CLAUDE', 'MIU_AGENT_CODEX', 'MIU_AGENT_CODEX_DIR',
+  'CREDENTIALS_DIRECTORY', 'MIU_SECRETS_KEY_FILE', 'PLAYWRIGHT_BROWSERS_PATH',
 ];
 const forbiddenEnvironment = ['GITHUB_TOKEN', 'GH_TOKEN', 'COMPOSER_AUTH', 'GIT_CONFIG_COUNT', 'UNLISTED_MARKER'];
 const waitForClose = (child) => new Promise((resolve, reject) => {
@@ -50,7 +52,11 @@ function suppliedEnvironment(root) {
     PATH: '/synthetic/bin', HOME: root, TMPDIR: root, LANG: 'C', LC_ALL: 'C',
     MIU_PROFILES: 'synthetic-profiles', MIU_AGENT_USER: 'synthetic-user',
     MIU_AGENT_REX: 'synthetic-rex', MIU_AGENT_EXEC: 'synthetic-exec',
-    MIU_AGENT_BASE_PATH: 'synthetic-base', GITHUB_TOKEN: 'synthetic-secret',
+    MIU_AGENT_BASE_PATH: 'synthetic-base',
+    MIU_AGENT_LIB: '/synthetic/lib', MIU_AGENT_CLAUDE: '/synthetic/bin/claude',
+    MIU_AGENT_CODEX: '/synthetic/bin/codex', MIU_AGENT_CODEX_DIR: '/synthetic/codex',
+    CREDENTIALS_DIRECTORY: '/synthetic/credentials', MIU_SECRETS_KEY_FILE: '/synthetic/key',
+    PLAYWRIGHT_BROWSERS_PATH: '/synthetic/browsers', GITHUB_TOKEN: 'synthetic-secret',
     GH_TOKEN: 'synthetic-secret', COMPOSER_AUTH: 'synthetic-secret',
     GIT_CONFIG_COUNT: '1', UNLISTED_MARKER: 'synthetic-value',
   };
@@ -141,4 +147,11 @@ test('refuses an existing run directory before spawning', async (t) => {
   await assert.rejects(launch({ requestId: 'existing-run', runName: 'already-owned' }, { isCancelled: () => false }));
   assert.deepEqual(fs.readdirSync(f.runsDirectory), ['already-owned']);
   assert.deepEqual(fs.readdirSync(existingRun), []);
+});
+
+test('rejects relative trusted-worker configuration locators before launch', (t) => {
+  const f = fixture(t);
+  assert.throws(() => createWorkerLauncher({ workerPath: f.workerPath, runsDirectory: f.runsDirectory,
+    environment: { MIU_AGENT_CLAUDE: 'relative/claude' } }), /absolute worker configuration path required/);
+  assert.deepEqual(fs.readdirSync(f.runsDirectory), []);
 });

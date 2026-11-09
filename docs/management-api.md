@@ -52,7 +52,9 @@ the store so revocation applies to subsequent requests.
 `RequestStore` uses Node's built-in SQLite API, requiring Node 22.13 or later.
 The installer already selects Node 24. Request identity and the single capacity
 slot are reserved in one transaction before launch. Identical retries return
-the existing request; changed intent is refused. There is no automatic key
+the existing request using its admitted authentication mode, even if that engine
+has since been disabled or its mode changed; changed caller intent is refused.
+Current principal scopes and repository grants still apply. There is no automatic key
 expiry, PID-based takeover or uncertain-launch replay. The default retention
 limit is 10,000 requests; reaching it refuses new admissions.
 
@@ -157,3 +159,8 @@ launch or replay work.
 
 `runs:trusted` grants authority to execute the selected PR's code on a trusted
 shared host. Require a prior trust decision before issuing that scope.
+
+The supervised worker receives an explicit environment. Installed agent CLI,
+agent library, Codex working-directory, browser-binary, and sealing-key locator
+configuration is retained only as absolute paths. Secret values and ambient
+GitHub tokens are excluded; agent subprocesses apply their own environment filter.

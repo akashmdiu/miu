@@ -40,7 +40,7 @@ async function fixture(t, { scopes = ['health:read', 'app:read', 'runs:submit', 
     app: async () => ({ installed: true, sourceRevision: 'unknown', status: 'ready', privateExtra: 'PRIVATE-MARKER' }),
     repositories: async () => repositories,
     models: async () => models,
-    authenticationMode: async () => authMode,
+    authenticationMode: async () => typeof authMode === 'function' ? authMode() : authMode,
   });
   const server = createServer((req, res) => { Promise.resolve(handler(req, res)).then((handled) => { if (!handled) { res.setHeader('x-browser-delegated', 'yes'); res.statusCode = 404; res.end(); } }, () => { if (!res.headersSent) { res.statusCode = 500; res.end(); } }); });
   server.requestTimeout = 2500;
@@ -269,4 +269,29 @@ test('unknown authenticated management routes return stable not found', async (t
   const response = await call(base, '/management/v1/no-such-operation', { token });
   assert.equal(response.status, 404);
   assert.deepEqual(await response.json(), { ok: false, code: 'not_found' });
+});
+
+
+test('identical HTTP retries retain admitted authentication mode even when engine is disabled', async (t) => {
+  let currentMode = 'plan', retained = null, admissions = 0;
+  const models = ['claude'];
+  const f = await fixture(t, { models, authMode: () => currentMode,
+    read: async () => retained ? { record: retained, observation: 'retained' } : null,
+    submit: async (args) => {
+      if (retained) {
+        if (JSON.stringify(args.intent) !== JSON.stringify(retained.intent)) throw Object.assign(new Error('conflict'), { code: 'request_conflict' });
+        return { created: false, record: retained };
+      }
+      admissions += 1;
+      retained = requestRecord({ intent: args.intent });
+      return { created: true, record: retained };
+    },
+  });
+  assert.equal((await postSubmit(f.base, { token: f.token })).status, 201);
+  currentMode = 'api';
+  assert.equal((await postSubmit(f.base, { token: f.token })).status, 200);
+  currentMode = 'off'; models.length = 0;
+  assert.equal((await postSubmit(f.base, { token: f.token })).status, 200);
+  assert.equal((await postSubmit(f.base, { token: f.token, body: { ...runIntent, headSha: 'c'.repeat(40) } })).status, 409);
+  assert.equal(admissions, 1);
 });
