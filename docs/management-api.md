@@ -61,7 +61,7 @@ limit is 10,000 requests; reaching it refuses new admissions.
 `ManagedRuns` keeps live child handles separate from retained records. A new
 controller reports retained state and cannot signal a persisted PID. Terminal
 completion requires a worker acknowledgement bound to the request, run and
-revisions, successful cleanup, child closure, and a positive observation that
+revisions, successful cleanup (including verified absence after an agent-account removal fallback), child closure, and a positive observation that
 the owned process group has stopped. Missing proof records `unknown_effect`
 and retains capacity. Cancellation persists intent and sends an IPC message;
 delivery alone does not prove cancellation. Evidence currently exposes only
