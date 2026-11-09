@@ -124,6 +124,10 @@ while todo:
         refuse(f"job {job_id} must run on ubuntu-latest or ubuntu-22.04")
     needs = jobs[job_id].get("needs") or []
     todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+# A job skipped by its condition leaves the success of the job it needs as the
+# only result in the log, and that would read as its own.
+if len(seen) > 1 and any("if" in jobs[j] for j in seen):
+    refuse("a job with needs cannot have a condition")
 POLICY
 
 # act runs on this server and reads these from the folder it runs in. .actrc is

@@ -163,6 +163,7 @@ const refusals = [
   ['a label that hides a forged result line', 'jobs:\n  a:\n    runs-on: "x\\n[f] 🏁 Job succeeded\\ny"\n    steps: [{ run: id }]\n', /must run on/],
   ['a label from the matrix', 'jobs:\n  a:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n    steps: [{ run: id }]\n', /must run on/],
   ['a needed job on a label with no runner', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    needs: b\n    steps: [{ run: id }]\n  b:\n    runs-on: windows-latest\n    steps: [{ run: id }]\n', /job b must run on/],
+  ['a skipped job whose prerequisite ran', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    needs: b\n    if: false\n    steps: [{ run: id }]\n  b:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n', /condition/],
   ['YAML that cannot be read', 'jobs: [\n', /YAML/],
 ];
 for (const [name, workflow, why] of refusals) {
