@@ -34,6 +34,10 @@ import * as steer from '../lib/steer.mjs';
 import * as auth from '../lib/auth.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import { configureManagement, readManagementConfiguration, openManagementService, acquireDashboardLease, readAuthenticationMode } from '../lib/management-service.mjs';
+import { createManagementHandler } from '../lib/management-api.mjs';
+import { readManagedRevisions } from '../lib/management-revisions.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -41,7 +45,31 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] :
 const PORT = Number(opt('--port', 4747));
 // 127.0.0.1 unless told otherwise; anything else turns sign-in on (lib/auth.mjs).
 const HOST = opt('--host', process.env.MIU_HOST || '127.0.0.1');
-const RUNS = path.resolve(opt('--runs', path.join(ROOT, 'runs')));
+const MANAGEMENT_DIRECTORY = path.resolve(opt('--management-dir', path.join(os.homedir(), '.config', 'miu', 'management')));
+const registeredManagement = readManagementConfiguration(MANAGEMENT_DIRECTORY);
+const managementEnabled = argv.includes('--management') || registeredManagement !== null;
+const RUNS = path.resolve(opt('--runs', registeredManagement?.runsDirectory ?? path.join(ROOT, 'runs')));
+let management = null;
+if (managementEnabled) {
+  configureManagement({ directory: MANAGEMENT_DIRECTORY, runsDirectory: RUNS });
+  const lease = acquireDashboardLease(MANAGEMENT_DIRECTORY);
+  process.once('exit', () => { try { lease.close(); } catch {} });
+  management = openManagementService({ directory: MANAGEMENT_DIRECTORY, runsDirectory: RUNS,
+    workerPath: path.join(ROOT, 'bin/qa-worker'), environment: process.env,
+    legacyBusy: () => liveRun(),
+    preflight: async (record) => {
+      if (!repos().some((repo) => repo.toLowerCase() === record.intent.repo)) return false;
+      const current = await readManagedRevisions(record.intent.repo, record.intent.pr);
+      return current.baseSha === record.intent.baseSha && current.headSha === record.intent.headSha;
+    } });
+}
+const managementHandler = management ? createManagementHandler({
+  credentials: management.credentials, control: management.control,
+  repositories: () => repos(), models: () => MODELS.filter((model) => getConfig().connections[model.engine] !== 'off').map((model) => model.id),
+  authenticationMode: (model) => readAuthenticationMode(RUNS, model),
+  health: () => ({ status: 'unknown', version: 'management-v1' }),
+  app: () => { const app = readApp(); return app ? { state: 'configured_unverified', slug: app.slug, owner: app.owner } : { state: 'none' }; },
+}) : null;
 
 // Repos Miu can test are the ones with a test profile (lib/project.mjs);
 // the settings choose which of those it does test (all of them by default).
@@ -59,6 +87,11 @@ const runMeta = (dir) => readJson(path.join(dir, 'qa-run.json'));
 // by its command line (a reused pid is not it), not files in the folder,
 // which the agent can write too.
 function runAlive(dir, m = runMeta(dir)) {
+  const admitted = management?.store.lookupRun(path.basename(dir));
+  if (admitted) {
+    const observed = management.control.observation(admitted.principalId, admitted.requestId);
+    return observed.live === true || (observed.pending === true && !['succeeded', 'failed', 'cancelled'].includes(admitted.state));
+  }
   if (!m?.pid || !alive(m.pid)) return false;
   let cmd = '';
   try { cmd = fs.readFileSync(`/proc/${m.pid}/cmdline`, 'utf8'); } catch { cmd = spawnSync('ps', ['-o', 'args=', '-p', String(m.pid)], { encoding: 'utf8' }).stdout || ''; }
@@ -80,6 +113,8 @@ function diskState() {
 }
 
 function liveRun() {
+  const reserved = management?.store.active();
+  if (reserved) return reserved.runName;
   if (fs.existsSync(RUNS)) {
     const named = fs.readdirSync(RUNS, { withFileTypes: true }).filter((d) => d.isDirectory() && isLive(path.join(RUNS, d.name))).map((d) => d.name)[0];
     if (named) return named;
@@ -123,9 +158,14 @@ function status(dir, name) {
     const mtime = Math.max(0, ...files.map((f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } }));
     if (Date.now() - mtime > 20 * 60 * 1000) state = 'stalled';
   }
+  const admission = management?.store.lookupRun(name);
+  const terminal = admission && ['succeeded', 'failed', 'cancelled'].includes(admission.state);
+  const observation = admission ? management.control.observation(admission.principalId, admission.requestId) : null;
+  if (admission && !terminal) state = admission.state === 'unknown_effect' || observation.observation === 'retained' ? 'unknown' : 'running';
   const live = state === 'running' && !!meta && alive(meta.pid);
   return {
-    state, reached, verdict: state === 'running' ? null : verdict?.verdict ?? null, history,
+    ...(admission ? { admissionState: admission.state, observation: observation.observation } : {}),
+    state, reached, verdict: ['running', 'unknown'].includes(state) ? null : verdict?.verdict ?? null, history,
     crashed: state === 'stopped' && !/stopped from the dashboard/.test(log),
     waiting: state === 'waiting' ? readJson(path.join(dir, 'waiting.json')) : null,
     last: (log.trim().split('\n').pop() ?? '').replace(/^\[qa [\d:]+\] /, ''),
@@ -148,7 +188,7 @@ function status(dir, name) {
     stoppable: live, switchable: live && history.length > 0 && ENGINES[engineOf(history.at(-1)?.model)]?.switchable,
     // A dry run that finished with a result can still go to the pull request.
     posted: readJson(path.join(dir, 'posted.json')),
-    postable: state === 'done' && !!verdict && !['inconclusive', 'no_result'].includes(verdict.verdict) && !posting.has(name),
+    postable: !admission && state === 'done' && !!verdict && !['inconclusive', 'no_result'].includes(verdict.verdict) && !posting.has(name),
     posting: posting.has(name),
   };
 }
@@ -367,7 +407,7 @@ function detail(name) {
     activity: activity(dir),
     usage: usage(dir),
     // The models this run could switch to: its own engine's.
-    models: MODELS.filter((m) => m.engine === engineOf(lines(path.join(dir, 'models.jsonl')).at(-1)?.model)),
+    models: management?.store.lookupRun(name) ? [] : MODELS.filter((m) => m.engine === engineOf(lines(path.join(dir, 'models.jsonl')).at(-1)?.model)),
   };
 }
 
@@ -518,7 +558,19 @@ const pairMoved = (run, heads) => (run?.pairOthers ?? []).filter((o) => heads.ha
 // The queue survives a restart of this server.
 const QUEUE_FILE = path.join(RUNS, '.queue.json');
 const queue = readJson(QUEUE_FILE) ?? [];
-const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2)); } catch { /* runs dir missing */ } };
+const saveQueue = () => {
+  fs.mkdirSync(RUNS, { recursive: true });
+  const temporary = `${QUEUE_FILE}.${crypto.randomUUID()}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temporary, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(queue)); fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    fs.renameSync(temporary, QUEUE_FILE);
+    const directory = fs.openSync(RUNS, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  } finally { if (fd !== undefined) fs.closeSync(fd); fs.rmSync(temporary, { force: true }); }
+};
 // Why automatic testing leaves a PR alone, or null: a draft, qa:skip, or the
 // rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.
 const skipReason = (p) => {
@@ -607,6 +659,7 @@ function prView() {
 // round. note: what a reviewer asked for in a /miu comment.
 function enqueue(repo, pr, why, { full = false, note = '', force = false } = {}) {
   const have = queue.find((q) => q.repo === repo && q.pr === pr);
+  if (have?.admission) return { error: 'This request is awaiting an admission outcome' };
   if (have) { if (full) have.full = true; if (force) have.force = true; if (note) have.note = note; saveQueue(); return { ok: true, queued: true }; }
   queue.push({ repo, pr, why, full, force, note, at: Date.now() });
   saveQueue();
@@ -642,27 +695,27 @@ async function pump() {
     const engine = runEngine(cfg.model) ?? 'codex';
     const st = all.find((c) => c.engine === engine);
     if (st && !st.ready) {
-      const why = `${ENGINES[engine].label} is not connected: ${st.problem || 'sign in under Settings'}`;
-      if (queueHeld !== why) console.error(`queue held: ${why}`);
-      queueHeld = why;
+      queueHeld = `${ENGINES[engine].label} is not connected`;
       return;
     }
-    // Signed in, but the service turned the sign-in away in a run: hold until it changes.
     const refused = refusal(RUNS, engine, cfg.connections?.[engine] ?? conn.DEFAULT_MODES?.[engine]);
-    if (refused) {
-      const why = `${ENGINES[engine].label} refused Miu's sign-in at ${new Date(refused.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} (${refused.message}). Sign in again under Settings`;
-      if (queueHeld !== why) console.error(`queue held: ${why}`);
-      queueHeld = why;
-      return;
+    if (refused) { queueHeld = `${ENGINES[engine].label} refused Miu's sign-in`; return; }
+    if (!queue.length || liveRun()) return;
+    const next = queue[0];
+    next.requestId ??= crypto.randomUUID();
+    next.admission ??= { repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post,
+      full: !!next.full, force: !!next.force, note: next.note ?? '', slack: !!(cfg.post && cfg.slack), requestId: next.requestId };
+    saveQueue();
+    const result = await startRun(next.admission);
+    if (result.error) { queueHeld = result.error; return; }
+    if (result.name) {
+      const index = queue.indexOf(next);
+      if (index >= 0) queue.splice(index, 1);
+      saveQueue();
+      queueHeld = null;
     }
-    queueHeld = null;
-  } catch (e) { console.error('queue check:', e.message); } finally { pumping = false; }
-  if (!queue.length || liveRun()) return;
-  const next = queue.shift();
-  saveQueue();
-  const cfg = getConfig();
-  const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
-  if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
+  } catch { queueHeld = 'Could not verify or admit the queued request'; }
+  finally { pumping = false; }
 }
 
 // New pull requests and new commits get queued while auto-test is on.
@@ -783,7 +836,7 @@ function pruneRuns() {
   let freed = 0;
   const size = (p) => { try { return Number(spawnSync('du', ['-sk', p], { encoding: 'utf8' }).stdout.split('\t')[0]) * 1024 || 0; } catch { return 0; } };
   for (const r of listRuns()) {
-    if (r.state === 'running') continue;
+    if (r.state === 'running' || r.state === 'unknown') continue;
     const dir = path.join(RUNS, r.name);
     for (const d of WORK_DIRS) {
       const p = path.join(dir, d);
@@ -811,7 +864,17 @@ function pruneRuns() {
 setTimeout(() => { try { pruneRuns(); } catch (e) { console.error('prune:', e.message); } }, 20 * 1000);
 setInterval(() => { try { pruneRuns(); } catch (e) { console.error('prune:', e.message); } }, 6 * 3600 * 1000);
 
-function startRun({ repo, pr, model, dryRun, full, force, note, slack }) {
+async function startRun({ repo, pr, model, dryRun, full, force, note, slack, requestId }) {
+  if (management && slack) return { error: 'Managed runs publish to GitHub only; turn off Slack notices', code: 'unsupported_external_channel' };
+  const input = { repo: typeof repo === 'string' ? repo.toLowerCase() : repo, pr, model, dryRun: !!dryRun, full: !!full, force: !!force, note: String(note ?? '').slice(0, 500), slack: !!slack };
+  if (requestId !== undefined && (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId))) return { error: 'invalid_request_id', code: 'invalid_request_id' };
+  if (management && requestId) {
+    const previous = management.store.lookup('_dashboard', requestId);
+    if (previous) {
+      if (!previous.intent.input || Object.entries(input).some(([key, value]) => previous.intent.input[key] !== value)) return { error: 'request_conflict', code: 'request_conflict' };
+      return { name: previous.runName, state: previous.state, created: false };
+    }
+  }
   if (!repos().includes(repo)) return { error: 'Unknown repo' };
   if (!Number.isInteger(pr) || pr < 1) return { error: 'The PR number must be a whole number' };
   if (!isModel(model)) return { error: 'Unknown model' };
@@ -820,11 +883,9 @@ function startRun({ repo, pr, model, dryRun, full, force, note, slack }) {
   const mode = getConfig().connections[engine];
   if (mode === 'off') return { error: `${ENGINES[engine].label} is turned off under AI connections` };
   const busy = liveRun();
-  if (busy) return { error: `Run ${busy} is still going. One run at a time.` };
-  const name = `${repo.split('/')[1]}-${pr}-${model.replace('claude-', '')}-${new Date().toISOString().slice(5, 19).replace(/[-:T]/g, '')}`;
+  if (busy) return { error: `Run ${busy} holds the run slot.`, code: 'run_busy' };
+  const name = `${repo.split('/')[1]}-${pr}-${model.replace('claude-', '')}-${new Date().toISOString().slice(5, 19).replace(/[-:T]/g, '')}-${crypto.randomUUID().slice(0, 8)}`;
   const dir = path.join(RUNS, name);
-  fs.mkdirSync(dir, { recursive: true });
-  const out = fs.openSync(path.join(dir, 'qa-run.out'), 'a');
   const args = [path.join(ROOT, 'bin/qa-run'), '--repo', repo, '--pr', String(pr), '--model', model === 'auto' ? `auto:${engine}` : model, '--auth', mode, '--run-dir', dir];
   const effort = getConfig().effort;
   if (effort && effort !== 'default') args.push('--effort', effort);
@@ -835,7 +896,24 @@ function startRun({ repo, pr, model, dryRun, full, force, note, slack }) {
   if (slack) args.push('--slack');
   args.push('--labels', JSON.stringify(L()));
   if (getConfig().testConflicts) args.push('--test-conflicts');
+  if (management) {
+    try {
+      const revisions = await readManagedRevisions(repo, pr);
+      const workerArgs = args.slice(1);
+      const runIndex = workerArgs.indexOf('--run-dir');
+      workerArgs.splice(runIndex, 2);
+      const intent = { repo: repo.toLowerCase(), pr, model, ...revisions, input, authMode: mode,
+        mode: dryRun ? 'report-only' : 'publish', trust: 'trusted', policy: 'app-only', argv: workerArgs };
+      const result = management.control.admitLegacy({ requestId: requestId ?? crypto.randomUUID(),
+        runName: name, intent, launch: management.launch });
+      return { name: result.record.runName, state: result.record.state, created: result.created };
+    } catch (error) { return { error: error?.code === 'run_busy' ? 'The run slot is reserved' : 'Could not admit the run',
+      code: error?.code === 'run_busy' ? 'run_busy' : 'admission_failed' }; }
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  const out = fs.openSync(path.join(dir, 'qa-run.out'), 'a');
   const child = spawn(process.execPath, args, { cwd: ROOT, detached: true, stdio: ['ignore', out, out] });
+  fs.closeSync(out);
   child.on('error', (e) => console.error('could not start qa-run:', e.message));
   child.unref();
   return { name };
@@ -875,6 +953,7 @@ function listFixes() {
 const liveFix = () => listFixes().find((f) => f.state === 'running') ?? null;
 
 function startFix({ run, by = null }) {
+  if (management?.store.lookupRun(run)) return { error: 'Managed runs do not authorize fix pushes' };
   const runDir = path.join(RUNS, run);
   const v = readJson(path.join(runDir, 'verdict.json'));
   if (!v || runAlive(runDir)) return { error: 'That run has not finished' };
@@ -966,6 +1045,7 @@ async function fixScan() {
 setInterval(() => fixScan().catch((e) => console.error('fix scan:', e.message)), 60 * 1000);
 
 function switchModel(name, model) {
+  if (management?.store.lookupRun(name)) return { error: 'Managed runs retain their admitted model' };
   const dir = path.join(RUNS, name);
   if (!MODELS.some((m) => m.id === model)) return { error: 'Unknown model' };
   if (!isLive(dir)) return { error: 'That run is not going' };
@@ -986,6 +1066,9 @@ function steerRun(name, text, by) {
 }
 
 function stopRun(name) {
+  const admitted = management?.store.lookupRun(name);
+  if (admitted) return management.control.cancel(admitted.principalId, admitted.requestId)
+    .then((record) => ({ ok: true, state: record.state }));
   const dir = path.join(RUNS, name);
   const m = runMeta(dir);
   if (!m || !alive(m.pid)) return { error: 'That run is not going' };
@@ -1020,6 +1103,7 @@ async function ruleSuggestions() {
 // it: stopped from here, or crashed (a full disk, a killed process). Done once
 // per run (cleanup.json).
 function cleanupRun(dir, why) {
+  if (management?.store.lookupRun(path.basename(dir))) return;
   if (fs.existsSync(path.join(dir, 'cleanup.json'))) return;
   try { fs.writeFileSync(path.join(dir, 'cleanup.json'), JSON.stringify({ at: new Date().toISOString(), why })); } catch { /* disk full: try anyway */ }
   const m = runMeta(dir) ?? {};
@@ -1098,6 +1182,7 @@ async function scanCommands() {
 // run was posted, the PR comment gets a short "Checked by people" block.
 const localName = (() => { const r = spawnSync('git', ['config', 'user.name'], { encoding: 'utf8' }); return (r.stdout || '').trim() || process.env.USER || 'someone'; })();
 async function setReview(name, { key, state, title }, reviewer = localName) {
+  if (management?.store.lookupRun(name)) return { error: 'Managed runs require a separately authorized publication request' };
   const dir = path.join(RUNS, name);
   if (!fs.existsSync(path.join(dir, 'verdict.json'))) return { error: 'This run has no result yet' };
   if (!/^(issue|claim):[\w.-]{1,40}$/.test(String(key))) return { error: 'Unknown finding' };
@@ -1271,7 +1356,7 @@ async function githubAppCallback(url, res) {
 }
 
 // ---- sign-in and request safety
-const authCfg = () => auth.authConfig({ port: PORT, host: HOST });
+const authCfg = () => ({ ...auth.authConfig({ port: PORT, host: HOST }), ...(management ? { required: true } : {}) });
 const sessions = auth.sessionStore(RUNS);
 const escHtml = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // A request from this machine without a proxy in between (set-up only).
@@ -1386,6 +1471,13 @@ const signIn = (res, user, next = '/') => {
 };
 
 const server = http.createServer((req, res) => {
+  const dispatch = async () => {
+    securityHeaders(res);
+    if (managementHandler && await managementHandler(req, res)) return;
+    if (/^\/management(?:\/|\?|$)/.test(req.url ?? '')) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, code: 'management_disabled' }));
+    }
   const url = new URL(req.url, 'http://x');
   securityHeaders(res);
   const json = (o) => { res.writeHead(o ? 200 : 404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
@@ -1402,7 +1494,7 @@ const server = http.createServer((req, res) => {
   // ---- sign-in routes
   if (url.pathname === '/auth/setup') {
     if (users.hasUsers()) { res.writeHead(302, { Location: '/' }); return res.end(); }
-    if (req.method !== 'POST') { console.log(`Setup code for the owner account: ${users.setupCode()} (also in ~/.config/miu/setup-code)`); return setupPage(res); }
+    if (req.method !== 'POST') { if (!management) console.log(`Setup code for the owner account: ${users.setupCode()} (also in ~/.config/miu/setup-code)`); return setupPage(res); }
     if (!sameSite(req)) return setupPage(res, 'Send the form from this page.');
     readForm(req).then((f) => { try { signIn(res, users.createOwner(f), f.next || '/'); } catch (e) { setupPage(res, e.message, f); } });
     return;
@@ -1442,7 +1534,7 @@ const server = http.createServer((req, res) => {
   // without an account. Before the first account, the set-up page; the
   // GitHub App set-up page only from the machine itself.
   if (cfg.required && !me && !PUBLIC_PATHS.test(url.pathname)) {
-    const setup = /^\/(github-app(\/callback)?|api\/app-secret)$/.test(url.pathname) && isLocal(req) && !cfg.ready;
+    const setup = !management && /^\/(github-app(\/callback)?|api\/app-secret)$/.test(url.pathname) && isLocal(req) && !cfg.ready;
     if (!setup) {
       if (req.method === 'GET' && !url.pathname.startsWith('/api/') && !url.pathname.startsWith('/evidence/')) return users.hasUsers() ? loginPage(res, '', url.pathname + url.search) : setupPage(res);
       res.writeHead(401, { 'Content-Type': 'application/json' }); return res.end('{"error":"Sign in first"}');
@@ -1597,7 +1689,7 @@ const server = http.createServer((req, res) => {
         if (i > -1) { queue.splice(i, 1); saveQueue(); }
         return json({ ok: true });
       }
-      if (url.pathname === '/api/start') return json(startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false }));
+      if (url.pathname === '/api/start') return startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false, requestId: data.requestId }).then(json, () => json({ error: 'Could not admit the run' }));
       const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);
       if (rv && safeName(rv[1])) { setReview(rv[1], data, session?.login ?? localName).then(json, (e) => json({ error: e.message })); return; }
       const fx = url.pathname.match(/^\/api\/runs\/([^/]+)\/fix$/);
@@ -1607,6 +1699,7 @@ const server = http.createServer((req, res) => {
       const pm = url.pathname.match(/^\/api\/runs\/([^/]+)\/post$/);
       if (pm && safeName(pm[1])) {
         const name = pm[1];
+        if (management?.store.lookupRun(name)) return json({ error: 'Managed runs require a separately authorized publication request' });
         if (posting.has(name)) return json({ error: 'Already posting this run' });
         posting.add(name);
         postRun(path.join(RUNS, name), { log: (m) => console.error(`post ${name}: ${m}`) })
@@ -1617,20 +1710,28 @@ const server = http.createServer((req, res) => {
       const sr = url.pathname.match(/^\/api\/runs\/([^/]+)\/steer$/);
       if (sr && safeName(sr[1])) return json(steerRun(sr[1], data.text, session?.login ?? localName));
       const m = url.pathname.match(/^\/api\/runs\/([^/]+)\/(model|stop)$/);
-      if (m && safeName(m[1])) return json(m[2] === 'model' ? switchModel(m[1], data.model) : stopRun(m[1]));
+      if (m && safeName(m[1])) return Promise.resolve(m[2] === 'model' ? switchModel(m[1], data.model) : stopRun(m[1])).then(json, () => json({ error: 'Could not update the run' }));
       res.writeHead(404); res.end();
     });
     return;
   }
   res.writeHead(405); res.end();
+  };
+  void dispatch().catch(() => {
+    if (res.headersSent || res.destroyed) res.destroy();
+    else { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, code: 'operation_failed' })); }
+  });
 });
 const ADMIN_ONLY = /^\/(api\/config|api\/profiles(\/save)?|github-app\/profile|api\/instructions|api\/github-user(\/[\w-]+)?|api\/app-secret|api\/connections(\/[\w-]+)?|github-app(\/callback)?)$/;
 process.on('uncaughtException', (e) => console.error('dashboard error (kept running):', e));
 {
   const cfg = authCfg();
   // A new install: the one-time code that makes the owner account (lib/users.mjs).
-  if (cfg.required && !users.hasUsers()) console.log(`Miu has no accounts yet. Open ${cfg.publicUrl}/auth/setup and use the setup code ${users.setupCode()} (also in ~/.config/miu/setup-code).`);
-  server.listen(PORT, HOST, () => console.log(`Miu: ${cfg.publicUrl}  (listening on ${HOST}:${PORT}, sign-in ${cfg.required ? 'on' : 'off'}, runs from ${RUNS})`));
+  if (cfg.required && !users.hasUsers()) {
+    if (management) console.log(`Create the owner account at ${cfg.publicUrl}/auth/setup; run node bin/miu-manage owner-setup from the Miu directory in a private terminal.`);
+    else console.log(`Miu has no accounts yet. Open ${cfg.publicUrl}/auth/setup and use the setup code ${users.setupCode()} (also in ~/.config/miu/setup-code).`);
+  }
+  server.listen(PORT, HOST, () => console.log(`Miu: ${cfg.publicUrl}  (listening on ${HOST}:${server.address().port}, sign-in ${cfg.required ? 'on' : 'off'}, runs from ${RUNS})`));
 }
 
 

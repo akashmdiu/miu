@@ -645,7 +645,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const md = (s) => window.marked ? marked.parse(s ?? '') : '<pre>' + esc(s) + '</pre>';
 const VERDICT = { ok: 'Found OK', partial: 'Found partially OK', not_ok: 'Found NOT OK', inconclusive: 'No result', no_result: 'No result', already_fixed: 'Already fixed on dev', bugs: 'Reported bugs' };
 const VERDICT_P = { ok: 'Every claim that was tested holds.', partial: 'The core works, but a claim failed or an issue turned up.', not_ok: 'A blocker turned up.', inconclusive: 'The run wrote no claims (an old run, from before every verdict needed evidence). Test it again.', no_result: 'The run wrote no claims, so there is no verdict. It runs again.', already_fixed: 'The bug is gone on dev already, and a change there fixed it. The author was asked to close this PR if nothing in it is still needed.' };
-const STATE = { running: 'Test running', done: 'Finished', waiting: 'Waiting', stalled: 'No activity for 20 minutes', stopped: 'Stopped', conflict: 'Not tested: merge conflict or already in dev' };
+const STATE = { running: 'Test running', done: 'Finished', waiting: 'Waiting', unknown: 'Outcome unconfirmed; run slot reserved', stalled: 'No activity for 20 minutes', stopped: 'Stopped', conflict: 'Not tested: merge conflict or already in dev' };
 // MIU (set by the server above this script): { owner, repos: [{ full, name, label, role }] }.
 const REPO = Object.fromEntries(MIU.repos.map((r) => [r.name, r.label]));
 const I = {
@@ -2000,7 +2000,7 @@ document.addEventListener('click', async (e) => {
   if (act === 'recents') { ui.recentsOpen = !ui.recentsOpen; store.set('qa-recents', ui.recentsOpen); ui.sideKey = ''; return renderSide(); }
   if (act === 'refresh') { const b = t.closest('[data-act]'); b.disabled = true; b.querySelector('span').textContent = 'Refreshing'; await post('/api/refresh'); return refreshPrs(); }
   if (act === 'panel') { if (window.innerWidth <= 1100) ui.mobPanel = !ui.mobPanel; else { ui.panel = !ui.panel; store.set('qa-panel', ui.panel); } return renderRun(true); }
-  if (act === 'stop') { if (await ask({ title: 'Stop this run?', body: 'Its test site is removed and no report is written.', ok: 'Stop', danger: true })) { await post('/api/runs/' + encodeURIComponent(route()) + '/stop'); ui.key = ''; tick(); } return; }
+  if (act === 'stop') { if (await ask({ title: 'Stop this run?', body: 'Miu requests cancellation and keeps the run slot until shutdown and cleanup are confirmed.', ok: 'Stop', danger: true })) { const r = await post('/api/runs/' + encodeURIComponent(route()) + '/stop'); if (r.error || r.state === 'unknown_effect') await tell('Cancellation unconfirmed', r.error || 'The run slot remains reserved.'); ui.key = ''; tick(); } return; }
   if (act === 'fix') {
     if (!(await ask({ title: 'Fix it on the pull request?', body: 'Miu fixes the blockers, major issues and failed claims this test found, commits the change to the pull request\'s branch and tests the new commit. Nothing is pushed if the branch moved since the test.', ok: 'Fix it' }))) return;
     const b = t.closest('[data-act]'); b.disabled = true; b.textContent = 'Starting';
