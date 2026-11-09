@@ -43,17 +43,72 @@ cleanup() {
   done
   # Jobs run as root in their containers, so what they wrote needs root to remove.
   bounded 120 docker run --rm --pull=never -v "$root:/work" --entrypoint find catthehacker/ubuntu:act-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
-  rm -rf "$root" "$config" 2>/dev/null || true
+  bounded 120 rm -rf "$root" "$config" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 bounded 300 tar -x -C "$root"
 [ -f "$root/$workflow" ] || die "the pull request has no $workflow"
 
+# Miu's account runs pull request code in its fast checks, so it can call this
+# script with any tar. Before act sees a workflow, check what it asks of Docker.
+if [ -n "$(find "$root/.github" -type l -print -quit)" ]; then die "refused: a symbolic link under .github"; fi
+bounded 60 python3 -I - "$root/.github/workflows" <<'POLICY'
+import os, shlex, sys
+import yaml
+
+def refuse(path, why):
+    sys.exit(f"refused: {os.path.basename(path)}: {why}")
+
+def check(path, what, c):
+    if not isinstance(c, dict):
+        refuse(path, f"{what} must be a mapping")
+    extra = set(map(str, c)) - {"image", "env", "ports", "credentials", "options"}
+    if extra:
+        refuse(path, f"{what} sets {', '.join(sorted(extra))}")
+    options = c.get("options")
+    if options is None:
+        return
+    if not isinstance(options, str) or "${{" in options:
+        refuse(path, f"{what} has options that are not plain text")
+    for word in shlex.split(options):
+        if word.startswith("-") and not word.startswith("--health-"):
+            refuse(path, f"{what} has the option {word}")
+
+for folder, _, names in os.walk(sys.argv[1]):
+    for name in names:
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+        except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
+            refuse(path, "not readable as YAML")
+        jobs = doc.get("jobs") if isinstance(doc, dict) else None
+        if not isinstance(jobs, dict):
+            refuse(path, "no jobs mapping")
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                refuse(path, f"job {job_id} must be a mapping")
+            uses = job.get("uses")
+            if uses is not None and (not isinstance(uses, str) or not uses.startswith("./")):
+                refuse(path, f"job {job_id} calls a workflow from elsewhere")
+            container = job.get("container")
+            if container is not None and not isinstance(container, str):
+                check(path, f"job {job_id} container", container)
+            services = job.get("services")
+            if services is not None:
+                if not isinstance(services, dict):
+                    refuse(path, f"job {job_id} services must be a mapping")
+                for service_id, service in services.items():
+                    check(path, f"service {service_id}", service)
+POLICY
+
 # act runs on this server and reads these from the folder it runs in. .actrc is
 # options for act. The others are values for the job, and a link there would
 # hand a job a file from this server. A plain file holds nothing new.
-rm -rf "$root/.actrc"
+bounded 60 rm -rf "$root/.actrc"
 for f in .env .vars .input .secrets; do
   if [ -L "$root/$f" ]; then rm -f "$root/$f"; fi
 done
@@ -65,7 +120,7 @@ export XDG_CONFIG_HOME="$config"
 
 # Workflows expect a git checkout, and an archive has none. Any .git that came
 # in the tar is not ours, and its hooks would run here.
-rm -rf "$root/.git"
+bounded 120 rm -rf "$root/.git"
 quiet_git() { bounded 120 git -C "$root" -c core.hooksPath=/dev/null -c user.name=miu -c user.email=miu@localhost "$@"; }
 quiet_git init -q
 quiet_git add -A

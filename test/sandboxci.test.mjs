@@ -10,13 +10,17 @@ import { runSandboxCi, sandboxCiProblem, changesCiDefinition } from '../lib/sand
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-sandboxci-'));
 const check = { label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml' } };
+// The worker's workflow policy needs PyYAML, which the installer adds on a server.
+const hasYaml = spawnSync('python3', ['-c', 'import yaml']).status === 0;
+const needsYaml = { skip: hasYaml ? false : 'needs python3 with PyYAML' };
+const OK = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n';
 const script = (file, body) => fs.writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
 const git = (dir, ...args) => spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
 
 // A pull request's checkout: one commit, plus a file that was never committed.
 function repo(extra = {}) {
   const dir = fs.mkdtempSync(path.join(tmp, 'repo-'));
-  const files = { '.github/workflows/test.yml': 'on: push\n', 'code.php': '<?php\n', ...extra };
+  const files = { '.github/workflows/test.yml': OK, 'code.php': '<?php\n', ...extra };
   for (const [name, text] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
     fs.writeFileSync(path.join(dir, name), text);
@@ -33,6 +37,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\nshift 4\nexec "$@"`);
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
   script(path.join(bin, 'docker'), docker);
+  if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
     env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
@@ -115,7 +120,7 @@ test('a .git in the tar is thrown away, hooks and all', () => {
   const src = fs.mkdtempSync(path.join(tmp, 'evil-'));
   const marker = path.join(sandbox.home, 'hook-ran');
   fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
-  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), 'on: push\n');
+  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
   fs.mkdirSync(path.join(src, '.git/hooks'), { recursive: true });
   fs.writeFileSync(path.join(src, '.git/hooks/post-commit'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
   const tar = spawnSync('tar', ['-c', '-C', src, '.']);
@@ -143,6 +148,45 @@ test('the worker never asks Sandbox for a site', async () => {
   await runSandboxCi(check, repo({ 'sandbox.config.json': '{}' }), server({ home: sandbox.home }).env);
   const argv = sandbox.read('argv').split('\n');
   assert.equal(argv[argv.indexOf('--runtime') + 1], 'none');
+});
+
+const refusals = [
+  ['a job container that mounts the server', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    container:\n      image: x\n      volumes: ["/:/host"]\n    steps: [{ run: id }]\n', /volumes/],
+  ['a privileged service', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    services:\n      db:\n        image: x\n        options: --health-interval=1s --privileged\n    steps: [{ run: id }]\n', /--privileged/],
+  ['options built from an expression', 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    container:\n      image: x\n      options: ${{ matrix.o }}\n    steps: [{ run: id }]\n', /plain text/],
+  ['a workflow from another repository', 'jobs:\n  a:\n    uses: evil/repo/.github/workflows/x.yml@main\n', /from elsewhere/],
+  ['keys hidden behind a YAML alias', 'x: &m\n  image: x\n  volumes: ["/:/host"]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    container: *m\n    steps: [{ run: id }]\n', /volumes/],
+  ['YAML that cannot be read', 'jobs: [\n', /YAML/],
+];
+for (const [name, workflow, why] of refusals) {
+  test(`the worker refuses ${name}`, needsYaml, async () => {
+    const sandbox = sandboxHome();
+    const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': workflow }), server({ home: sandbox.home }).env);
+    assert.match(r.notRun, why);
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+  });
+}
+
+test('the worker refuses a second workflow file that would be called from the first', needsYaml, async () => {
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': OK, '.github/workflows/called.yml': 'jobs:\n  a:\n    runs-on: x\n    services:\n      db:\n        image: x\n        volumes: ["/:/host"]\n' }), server({ home: sandbox.home }).env);
+  assert.match(r.notRun, /called\.yml/);
+});
+
+test('the worker refuses a workflow that is a symbolic link', async () => {
+  const sandbox = sandboxHome();
+  const dir = repo({ 'ci.yml': OK });
+  fs.rmSync(path.join(dir, '.github/workflows/test.yml'));
+  fs.symlinkSync('../../ci.yml', path.join(dir, '.github/workflows/test.yml'));
+  git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'link');
+  const r = await runSandboxCi(check, dir, server({ home: sandbox.home }).env);
+  assert.match(r.notRun, /symbolic link/);
+});
+
+test('an ordinary WordPress CI workflow is allowed', async () => {
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': 'jobs:\n  php:\n    runs-on: ubuntu-latest\n    container: php:${{ matrix.php }}\n    services:\n      mysql:\n        image: mysql:${{ matrix.db }}\n        env: { MYSQL_ROOT_PASSWORD: root }\n        ports: ["3306:3306"]\n        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-retries=5\n    steps: [{ run: composer test }]\n  shared:\n    uses: ./.github/workflows/test.yml\n' }), server({ home: sandbox.home }).env);
+  assert.equal(r.status, 0, JSON.stringify(r));
 });
 
 test('the worker refuses arguments Miu would never send', () => {

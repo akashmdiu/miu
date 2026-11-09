@@ -285,6 +285,7 @@ if [ -n "$SANDBOX_USER" ]; then
   [ "$SANDBOX_USER" != root ] || die "--sandbox-user: use the account that owns Sandbox, not root"
   id "$SANDBOX_USER" >/dev/null 2>&1 || die "--sandbox-user: no account named $SANDBOX_USER"
   say "Letting Miu run CI workflows as $SANDBOX_USER"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null
   install -d -m 0755 "$LIB"
   echo "$SANDBOX_USER" > "$LIB/sandbox-user"
   install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
