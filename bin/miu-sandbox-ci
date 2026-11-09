@@ -94,6 +94,14 @@ for job_id, job in jobs.items():
     # have rewritten it in the shared workspace.
     if job.get("uses") is not None:
         refuse(f"job {job_id} calls another workflow")
+    # A key that is not a string reads differently in the plan and in the run,
+    # so the count of runs below would not hold.
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if isinstance(matrix, dict):
+        rows = [matrix] + [r for k in ("include", "exclude") if isinstance(matrix.get(k), list) for r in matrix[k]]
+        if any(not isinstance(k, str) for r in rows if isinstance(r, dict) for k in r):
+            refuse(f"job {job_id} has a matrix name that is not text")
     container = job.get("container")
     if container is not None and not isinstance(container, str):
         check(f"job {job_id} container", container)
