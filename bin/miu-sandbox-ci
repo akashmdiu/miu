@@ -6,24 +6,25 @@
 # Miu's own account has no Docker access. The pull request's files arrive as a
 # tar on stdin, so that account never reads Miu's folders.
 #
-#   sandbox-ci <workflow> <event> <timeout-seconds> [job...]
+#   sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]
 #
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
 set -euo pipefail
 
 die() { echo "$*" >&2; exit 2; }
-[ $# -ge 3 ] || die "usage: sandbox-ci <workflow> <event> <timeout-seconds> [job...]"
-workflow=$1 event=$2 seconds=$3
-shift 3
+[ $# -ge 4 ] || die "usage: sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]"
+workflow=$1 event=$2 seconds=$3 job=$4
+shift 4
 
 [[ $workflow =~ ^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$ ]] || die "not a workflow path: $workflow"
 [[ $event =~ ^[a-z_]{1,64}$ ]] || die "not an event name: $event"
 [[ $seconds =~ ^[0-9]{1,5}$ ]] || die "not a timeout: $seconds"
-job_args=()
-for job in "$@"; do
-  [[ $job =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "not a job id: $job"
-  job_args+=(--job "$job")
+[[ $job =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "not a job id: $job"
+matrix_args=()
+for pair in "$@"; do
+  [[ $pair =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*=[A-Za-z0-9_.-]+$ ]] || die "not a matrix value: $pair"
+  matrix_args+=(--matrix-filter "$pair")
 done
 
 sb="$HOME/sandbox/sb-src/sb"
@@ -51,58 +52,57 @@ bounded 300 tar -x -C "$root"
 [ -f "$root/$workflow" ] || die "the pull request has no $workflow"
 
 # Miu's account runs pull request code in its fast checks, so it can call this
-# script with any tar. Before act sees a workflow, check what it asks of Docker.
+# script with any tar. Before act sees the workflow, check what it asks of Docker.
 if [ -n "$(find "$root/.github" -type l -print -quit)" ]; then die "refused: a symbolic link under .github"; fi
-bounded 60 python3 -I - "$root/.github/workflows" <<'POLICY'
+bounded 60 python3 -I - "$root/$workflow" <<'POLICY'
 import os, shlex, sys
 import yaml
 
-def refuse(path, why):
+path = sys.argv[1]
+
+def refuse(why):
     sys.exit(f"refused: {os.path.basename(path)}: {why}")
 
-def check(path, what, c):
+def check(what, c):
     if not isinstance(c, dict):
-        refuse(path, f"{what} must be a mapping")
+        refuse(f"{what} must be a mapping")
     extra = set(map(str, c)) - {"image", "env", "ports", "credentials", "options"}
     if extra:
-        refuse(path, f"{what} sets {', '.join(sorted(extra))}")
+        refuse(f"{what} sets {', '.join(sorted(extra))}")
     options = c.get("options")
     if options is None:
         return
-    if not isinstance(options, str) or "${{" in options:
-        refuse(path, f"{what} has options that are not plain text")
+    # act splits these with a different parser, which joins escaped lines.
+    if not isinstance(options, str) or "${{" in options or "\\" in options or any(ord(ch) < 32 and ch not in "\t\n" for ch in options):
+        refuse(f"{what} has options that are not plain text")
     for word in shlex.split(options):
         if word.startswith("-") and not word.startswith("--health-"):
-            refuse(path, f"{what} has the option {word}")
+            refuse(f"{what} has the option {word}")
 
-for folder, _, names in os.walk(sys.argv[1]):
-    for name in names:
-        if not name.endswith((".yml", ".yaml")):
-            continue
-        path = os.path.join(folder, name)
-        try:
-            with open(path, encoding="utf-8") as f:
-                doc = yaml.safe_load(f)
-        except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
-            refuse(path, "not readable as YAML")
-        jobs = doc.get("jobs") if isinstance(doc, dict) else None
-        if not isinstance(jobs, dict):
-            refuse(path, "no jobs mapping")
-        for job_id, job in jobs.items():
-            if not isinstance(job, dict):
-                refuse(path, f"job {job_id} must be a mapping")
-            uses = job.get("uses")
-            if uses is not None and (not isinstance(uses, str) or not uses.startswith("./")):
-                refuse(path, f"job {job_id} calls a workflow from elsewhere")
-            container = job.get("container")
-            if container is not None and not isinstance(container, str):
-                check(path, f"job {job_id} container", container)
-            services = job.get("services")
-            if services is not None:
-                if not isinstance(services, dict):
-                    refuse(path, f"job {job_id} services must be a mapping")
-                for service_id, service in services.items():
-                    check(path, f"service {service_id}", service)
+try:
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f)
+except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
+    refuse("not readable as YAML")
+jobs = doc.get("jobs") if isinstance(doc, dict) else None
+if not isinstance(jobs, dict):
+    refuse("no jobs mapping")
+for job_id, job in jobs.items():
+    if not isinstance(job, dict):
+        refuse(f"job {job_id} must be a mapping")
+    # act opens a called workflow when it reaches it, after earlier jobs could
+    # have rewritten it in the shared workspace.
+    if job.get("uses") is not None:
+        refuse(f"job {job_id} calls another workflow")
+    container = job.get("container")
+    if container is not None and not isinstance(container, str):
+        check(f"job {job_id} container", container)
+    services = job.get("services")
+    if services is not None:
+        if not isinstance(services, dict):
+            refuse(f"job {job_id} services must be a mapping")
+        for service_id, service in services.items():
+            check(f"service {service_id}", service)
 POLICY
 
 # act runs on this server and reads these from the folder it runs in. .actrc is
@@ -126,7 +126,20 @@ quiet_git init -q
 quiet_git add -A
 quiet_git commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
 
+# One job and one matrix combination, so one act process. A job can write to the
+# workspace, and a second process would read an .actrc the first one left there.
+# Sandbox starts one act per combination; each of those is its own fast check.
+plan=$(bounded 60 "$sb" ci plan "$root/$workflow" --json)
+bounded 30 python3 -I -c '
+import json, sys
+job, pairs = sys.argv[1], [a.split("=", 1) for a in sys.argv[2:]]
+plan = json.loads([l for l in sys.stdin if l.startswith("{")][-1])
+cells = [c for j in plan["jobs"] if j["id"] == job for c in j["cells"] if all(str(c["matrix"].get(k)) == v for k, v in pairs)]
+if len(cells) != 1:
+    sys.exit(f"refused: {len(cells)} matching runs of job {job}; a check runs exactly one, so name the matrix values")
+' "$job" "$@" <<<"$plan"
+
 # Never --runtime sandbox: that starts what the repository declares, Compose
 # files included, with this account's Docker access.
 bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
-  --event "$event" --timeout "$seconds" --runtime none ${job_args[@]+"${job_args[@]}"}
+  --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"}

@@ -55,7 +55,8 @@ A fast check can run one of the repository's GitHub Actions workflows instead of
   "when": "\\.php$",
   "sandbox_ci": {
     "workflow": ".github/workflows/test.yml",
-    "jobs": ["phpunit"],
+    "job": "phpunit",
+    "matrix": { "php": "8.3" },
     "timeout_minutes": 30
   }
 }
@@ -64,11 +65,12 @@ A fast check can run one of the repository's GitHub Actions workflows instead of
 | Field | Meaning |
 |---|---|
 | `workflow` | The workflow file, directly in `.github/workflows`. Required. |
-| `jobs` | Which job ids to run. The default is every job. |
+| `job` | The job id to run. Required. |
+| `matrix` | The matrix values to run, when the job has a matrix. They must pick out exactly one combination; add one fast check for each combination you want. |
 | `event` | The GitHub event the run simulates. The default is `pull_request`. |
 | `timeout_minutes` | The time limit, 1 to 240. The default is 30. |
 
-The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/` or `.actrc`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped. A workflow is refused, and reported as not run, if its job containers or services mount folders, set Docker options other than `--health-*`, or call a reusable workflow from another repository, or if `.github` holds a symbolic link. The workflow runs on its own: Miu does not start a Sandbox WordPress site for it, because that would run the repository's own Docker setup with the server's Docker access.
+The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/` or `.actrc`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped. A workflow is refused, and reported as not run, if its job containers or services mount folders, set Docker options other than `--health-*`, or call a reusable workflow, or if `.github` holds a symbolic link. The workflow runs on its own: Miu does not start a Sandbox WordPress site for it, because that would run the repository's own Docker setup with the server's Docker access.
 
 ## A plugin and its add-on
 
