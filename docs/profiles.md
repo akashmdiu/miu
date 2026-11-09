@@ -66,10 +66,9 @@ A fast check can run one of the repository's GitHub Actions workflows instead of
 | `workflow` | The workflow file, directly in `.github/workflows`. Required. |
 | `jobs` | Which job ids to run. The default is every job. |
 | `event` | The GitHub event the run simulates. The default is `pull_request`. |
-| `runtime` | `none` runs the workflow alone (the default). `sandbox` also starts a WordPress site for each matrix cell, at `WP_BASE_URL`; the repository needs a `sandbox.config.json` for that. |
 | `timeout_minutes` | The time limit, 1 to 240. The default is 30. |
 
-The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/`, `.actrc` or `sandbox.config*`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped.
+The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/` or `.actrc`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped. The workflow runs on its own: Miu does not start a Sandbox WordPress site for it, because that would run the repository's own Docker setup with the server's Docker access.
 
 ## A plugin and its add-on
 

@@ -28,11 +28,11 @@ function repo(extra = {}) {
 
 // `sudo` is the only stand-in on the way: it records how it was called and
 // runs the worker, the same as the rule install.sh writes.
-function server({ worker, home }) {
+function server({ worker, home, docker = 'exit 0' }) {
   const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
   script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\nshift 4\nexec "$@"`);
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
-  script(path.join(bin, 'docker'), 'exit 0');
+  script(path.join(bin, 'docker'), docker);
   return {
     env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
@@ -40,12 +40,12 @@ function server({ worker, home }) {
 }
 
 // A stand-in worker: takes the tar, prints what the test asks for.
-function fakeWorker({ stdout = '', stderr = '', exit = 0, sleep = 0 }) {
+function fakeWorker({ stdout = '', stderr = '', exit = 0, sleep = 0, ignoreTerm = false }) {
   const dir = fs.mkdtempSync(path.join(tmp, 'worker-'));
   fs.writeFileSync(path.join(dir, 'stdout'), stdout);
   fs.writeFileSync(path.join(dir, 'stderr'), stderr);
   const worker = path.join(dir, 'worker');
-  script(worker, `cat > /dev/null\nprintf '%s\\n' "$@" > "${dir}/argv"\ncat "${dir}/stdout"\ncat "${dir}/stderr" >&2\nsleep ${sleep}\nexit ${exit}`);
+  script(worker, `${ignoreTerm ? "trap '' TERM\n" : ''}cat > /dev/null\nprintf '%s\\n' "$@" > "${dir}/argv"\ncat "${dir}/stdout"\ncat "${dir}/stderr" >&2\nsleep ${sleep}\nexit ${exit}`);
   return { ...server({ worker }), worker, argv: () => fs.readFileSync(path.join(dir, 'argv'), 'utf8').trim().split('\n'), ran: () => fs.existsSync(path.join(dir, 'argv')) };
 }
 
@@ -54,7 +54,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `printf '%s\\n' "$@" > "${home}/argv"\nproject="$6"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
+  script(sb, `printf '%s\\n' "$@" > "${home}/argv"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
   return { home, read: (f) => fs.readFileSync(path.join(home, f), 'utf8').trim() };
 }
 
@@ -62,17 +62,17 @@ const report = (cells) => JSON.stringify({ ok: cells.every((c) => c.status === '
 
 test('goes through the one sudo rule, as the configured account', async () => {
   const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0 }]) });
-  const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', jobs: ['php', 'js'], runtime: 'sandbox', event: 'push', timeout_minutes: 5 } }, repo(), s.env);
+  const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', jobs: ['php', 'js'], event: 'push', timeout_minutes: 5 } }, repo(), s.env);
   assert.equal(r.status, 0);
   assert.deepEqual(s.sudoArgv().slice(0, 4), ['-n', '-H', '-u', 'ubuntu']);
   assert.equal(s.sudoArgv()[4], s.worker);
-  assert.deepEqual(s.argv(), ['.github/workflows/test.yml', 'push', '300', 'sandbox', 'php', 'js']);
+  assert.deepEqual(s.argv(), ['.github/workflows/test.yml', 'push', '300', 'php', 'js']);
 });
 
-test('defaults: every job, a pull request, no site, 30 minutes', async () => {
+test('defaults: every job, a pull request, 30 minutes', async () => {
   const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0 }]) });
   await runSandboxCi(check, repo(), s.env);
-  assert.deepEqual(s.argv(), ['.github/workflows/test.yml', 'pull_request', '1800', 'none']);
+  assert.deepEqual(s.argv(), ['.github/workflows/test.yml', 'pull_request', '1800']);
 });
 
 test('the worker runs the commit on this server and never asks for deploy steps', async () => {
@@ -98,16 +98,56 @@ test('jobs do not get the Docker socket, and a committed .actrc is ignored', asy
   assert.doesNotMatch(sandbox.read('files'), /actrc/);
 });
 
-test('a site needs the repository to declare one', async () => {
+test('files the tar brings cannot run or read anything on the server', async () => {
   const sandbox = sandboxHome();
-  const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', runtime: 'sandbox' } }, repo(), server({ home: sandbox.home }).env);
-  assert.match(r.notRun, /sandbox\.config\.json/);
-  assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+  const dir = repo();
+  fs.symlinkSync('/etc/hosts', path.join(dir, '.env'));
+  fs.writeFileSync(path.join(dir, '.vars'), 'PLAIN=1\n');
+  git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'links');
+  await runSandboxCi(check, dir, server({ home: sandbox.home }).env);
+  const files = sandbox.read('files').split('\n');
+  assert.ok(!files.includes('.env'));
+  assert.ok(files.includes('.vars'));
+});
+
+test('a .git in the tar is thrown away, hooks and all', () => {
+  const sandbox = sandboxHome();
+  const src = fs.mkdtempSync(path.join(tmp, 'evil-'));
+  const marker = path.join(sandbox.home, 'hook-ran');
+  fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), 'on: push\n');
+  fs.mkdirSync(path.join(src, '.git/hooks'), { recursive: true });
+  fs.writeFileSync(path.join(src, '.git/hooks/post-commit'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+  const tar = spawnSync('tar', ['-c', '-C', src, '.']);
+  const { env } = server({ home: sandbox.home });
+  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60'], { input: tar.stdout, env });
+  assert.equal(r.status, 0, String(r.stderr));
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(sandbox.read('git'), 'true');
+});
+
+test('removes the containers of its own run, and no others', async () => {
+  const sandbox = sandboxHome();
+  const log = path.join(sandbox.home, 'docker-log');
+  const docker = `case "$1" in
+ps) echo mine; echo other ;;
+inspect) if [ "$4" = mine ]; then cat "${sandbox.home}/project"; else echo /somewhere/else; fi ;;
+rm) echo "$3" >> "${log}" ;;
+esac`;
+  await runSandboxCi(check, repo(), server({ home: sandbox.home, docker }).env);
+  assert.equal(fs.readFileSync(log, 'utf8').trim(), 'mine');
+});
+
+test('the worker never asks Sandbox for a site', async () => {
+  const sandbox = sandboxHome();
+  await runSandboxCi(check, repo({ 'sandbox.config.json': '{}' }), server({ home: sandbox.home }).env);
+  const argv = sandbox.read('argv').split('\n');
+  assert.equal(argv[argv.indexOf('--runtime') + 1], 'none');
 });
 
 test('the worker refuses arguments Miu would never send', () => {
   const sandbox = sandboxHome();
-  for (const args of [['../../etc/passwd', 'push', '60', 'none'], ['.github/workflows/a.yml', 'push;id', '60', 'none'], ['.github/workflows/a.yml', 'push', 'x', 'none'], ['.github/workflows/a.yml', 'push', '60', 'host'], ['.github/workflows/a.yml', 'push', '60', 'none', '--allow-deploy']]) {
+  for (const args of [['../../etc/passwd', 'push', '60'], ['.github/workflows/a.yml', 'push;id', '60'], ['.github/workflows/a.yml', 'push', 'x'], ['.github/workflows/a.yml', 'push', '60', '--allow-deploy']]) {
     const r = spawnSync(WORKER, args, { input: '', env: { ...process.env, HOME: sandbox.home } });
     assert.equal(r.status, 2, args.join(' '));
   }
@@ -117,7 +157,7 @@ test('the worker refuses arguments Miu would never send', () => {
 test('a job that fails is a failure, with the output of what failed', async () => {
   const s = fakeWorker({ exit: 1, stdout: report([
     { label: 'good', status: 'passed', exit_code: 0, output: 'all fine' },
-    { label: 'bad', matrix: { php: '8.1' }, status: 'failed', exit_code: 1, output: 'PHPUnit: 2 failures' },
+    { label: 'bad', matrix: { php: '8.1' }, status: 'failed', exit_code: 1, output: 'PHPUnit: 2 failures\nJob failed' },
   ]) });
   const r = await runSandboxCi(check, repo(), s.env);
   assert.equal(r.status, 1);
@@ -128,7 +168,7 @@ test('a job that fails is a failure, with the output of what failed', async () =
 
 test('a real failure is reported even when another cell could not start', async () => {
   const s = fakeWorker({ exit: 1, stdout: report([
-    { label: 'bad', status: 'failed', exit_code: 2, output: 'assertion' },
+    { label: 'bad', status: 'failed', exit_code: 2, output: 'assertion\nJob failed' },
     { label: 'down', status: 'provision_failed', error: 'no port' },
   ]) });
   assert.equal((await runSandboxCi(check, repo(), s.env)).status, 1);
@@ -137,6 +177,7 @@ test('a real failure is reported even when another cell could not start', async 
 // A broken server must never read as a broken pull request.
 for (const [name, sb, expected] of [
   ['a cell that could not start', { exit: 1, stdout: report([{ label: 'a', status: 'provision_failed', error: 'no port left' }]) }, /no port left/],
+  ['act failing before the job ran', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: 'Error: No such image: catthehacker/ubuntu:act-22.04' }]) }, /No such image/],
   ['a cell that timed out', { exit: 1, stdout: report([{ label: 'a', status: 'failed', error: 'timed out after 900s' }]) }, /timed out/],
   ['a run with no cells', { stdout: report([]) }, /no jobs/i],
   ['a CLI that dies before running anything', { exit: 1, stderr: 'act not found\n' }, /act not found/],
@@ -172,6 +213,14 @@ test('stops a run that passes its time limit', async () => {
   assert.match(r.notRun, /time limit/);
 });
 
+test('moves on from a worker that will not stop', async () => {
+  const s = fakeWorker({ sleep: 3, ignoreTerm: true });
+  const started = Date.now();
+  const r = await runSandboxCi(check, repo(), s.env, { limitMs: 100, stopWaitMs: 100 });
+  assert.match(r.notRun, /time limit/);
+  assert.ok(Date.now() - started < 2500);
+});
+
 test('an invalid check is refused before anything runs', async () => {
   const s = fakeWorker({ stdout: report([]) });
   const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '../../etc/passwd' } }, repo(), s.env);
@@ -182,7 +231,7 @@ test('an invalid check is refused before anything runs', async () => {
 test('profile validation names what is wrong', () => {
   assert.equal(sandboxCiProblem({ label: 'tests', cmd: 'composer test' }), null);
   assert.equal(sandboxCiProblem(check), null);
-  assert.equal(sandboxCiProblem({ sandbox_ci: { workflow: '.github/workflows/a.yaml', jobs: ['php-8'], event: 'push', runtime: 'sandbox', timeout_minutes: 45 } }), null);
+  assert.equal(sandboxCiProblem({ sandbox_ci: { workflow: '.github/workflows/a.yaml', jobs: ['php-8'], event: 'push', timeout_minutes: 45 } }), null);
   for (const [bad, field] of [
     [{ sandbox_ci: 'ci.yml' }, 'object'],
     [{ cmd: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml' } }, 'cmd'],
@@ -191,7 +240,6 @@ test('profile validation names what is wrong', () => {
     [{ sandbox_ci: { workflow: '.github/workflows/a.yml', jobs: 'php' } }, 'jobs'],
     [{ sandbox_ci: { workflow: '.github/workflows/a.yml', jobs: ['--allow-deploy'] } }, 'jobs'],
     [{ sandbox_ci: { workflow: '.github/workflows/a.yml', event: 'Push!' } }, 'event'],
-    [{ sandbox_ci: { workflow: '.github/workflows/a.yml', runtime: 'docker' } }, 'runtime'],
     [{ sandbox_ci: { workflow: '.github/workflows/a.yml', timeout_minutes: 0 } }, 'timeout_minutes'],
     [{ sandbox_ci: { workflow: '.github/workflows/a.yml', timeout_minutes: 241 } }, 'timeout_minutes'],
   ]) assert.match(sandboxCiProblem(bad), new RegExp(field), JSON.stringify(bad));
@@ -201,7 +249,5 @@ test('a pull request cannot choose what the server runs', () => {
   assert.equal(changesCiDefinition(['src/a.php', '.github/workflows/test.yml']), true);
   assert.equal(changesCiDefinition(['.github/actions/setup/action.yml']), true);
   assert.equal(changesCiDefinition(['.actrc']), true);
-  assert.equal(changesCiDefinition(['sandbox.config.json']), true);
-  assert.equal(changesCiDefinition(['sandbox.config.php81.json']), true);
-  assert.equal(changesCiDefinition(['src/a.php', 'docs/.github-notes.md', 'sub/sandbox.config.json']), false);
+  assert.equal(changesCiDefinition(['src/a.php', 'docs/.github-notes.md']), false);
 });

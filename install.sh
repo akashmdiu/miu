@@ -278,12 +278,15 @@ if [ -n "$DOMAIN" ]; then
   setenv MIU_AUTH github
 fi
 
-# A later run without --sandbox-user keeps the account an earlier run set.
-[ -n "$SANDBOX_USER" ] || SANDBOX_USER=$(sed -n 's/^MIU_SANDBOX_USER=//p' "$ENVF")
+# A later run without --sandbox-user keeps the account an earlier run set. That
+# is kept where only root can write: it decides a sudo rule, and $ENVF is $MIU_USER's.
+[ -n "$SANDBOX_USER" ] || SANDBOX_USER=$(cat "$LIB/sandbox-user" 2>/dev/null || true)
 if [ -n "$SANDBOX_USER" ]; then
+  [ "$SANDBOX_USER" != root ] || die "--sandbox-user: use the account that owns Sandbox, not root"
   id "$SANDBOX_USER" >/dev/null 2>&1 || die "--sandbox-user: no account named $SANDBOX_USER"
   say "Letting Miu run CI workflows as $SANDBOX_USER"
   install -d -m 0755 "$LIB"
+  echo "$SANDBOX_USER" > "$LIB/sandbox-user"
   install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
   cat > /etc/sudoers.d/miu-sandbox-ci.tmp <<EOF
 # $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
