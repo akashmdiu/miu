@@ -289,6 +289,18 @@ if [ -n "$SANDBOX_USER" ]; then
   install -d -m 0755 "$LIB"
   echo "$SANDBOX_USER" > "$LIB/sandbox-user"
   install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
+  # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
+  # together; stop them all with: systemctl stop miu-ci.slice
+  cat > /etc/systemd/system/miu-ci.slice <<SLICE
+[Unit]
+Description=Miu's Sandbox CI job containers (capped)
+[Slice]
+MemoryAccounting=yes
+MemoryMax=4G
+CPUWeight=20
+CPUQuota=400%
+SLICE
+  systemctl daemon-reload
   cat > /etc/sudoers.d/miu-sandbox-ci.tmp <<EOF
 # $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
 $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci

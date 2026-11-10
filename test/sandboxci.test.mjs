@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -39,7 +39,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'docker'), docker);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
-    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER },
+    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8' },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
   };
 }
@@ -59,7 +59,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
+  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
   return { home, read: (f) => fs.readFileSync(path.join(home, f), 'utf8').trim() };
 }
 
@@ -99,8 +99,82 @@ test('the worker runs the commit on this server and never asks for deploy steps'
 test('jobs do not get the Docker socket, and a committed .actrc is ignored', async () => {
   const sandbox = sandboxHome();
   await runSandboxCi(check, repo({ '.actrc': '--privileged\n' }), server({ home: sandbox.home }).env);
-  assert.equal(sandbox.read('actrc'), '--container-daemon-socket=-');
+  assert.equal(sandbox.read('actrc').split('\n')[0], '--container-daemon-socket=-');
   assert.doesNotMatch(sandbox.read('files'), /actrc/);
+});
+
+test('every job container is capped and kept in miu-ci.slice', async () => {
+  const sandbox = sandboxHome();
+  await runSandboxCi(check, repo(), server({ home: sandbox.home }).env);
+  assert.match(sandbox.read('actrc'), /^--container-options --memory=2g --memory-swap=2g --cpus=2 --cgroup-parent=miu-ci\.slice$/m);
+});
+
+// Holds an flock on a file, the way a Sandbox host apply or another CI run would.
+function holdLock(file, mode) {
+  const ready = path.join(tmp, `ready-${process.hrtime.bigint()}`);
+  const child = spawn('python3', ['-c', `import fcntl,os,sys,time\nfd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT)\nfcntl.flock(fd, fcntl.${mode})\nopen(sys.argv[2],'w').close()\ntime.sleep(60)`, file, ready], { stdio: 'ignore' });
+  return new Promise((resolve) => { const t = setInterval(() => { if (fs.existsSync(ready)) { clearInterval(t); resolve(child); } }, 20); });
+}
+
+test('does not start while a Sandbox host apply holds its lock', async () => {
+  const sandbox = sandboxHome();
+  const lock = path.join(tmp, `apply-${process.hrtime.bigint()}.lock`);
+  const holder = await holdLock(lock, 'LOCK_EX');
+  try {
+    const s = server({ home: sandbox.home });
+    const r = await runSandboxCi(check, repo(), { ...s.env, MIU_CI_APPLY_LOCKS: lock });
+    assert.match(r.notRun, /host apply is in progress/);
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+  } finally { holder.kill(); }
+});
+
+test('an apply lock nobody holds does not stop a run', async () => {
+  const sandbox = sandboxHome();
+  const lock = path.join(tmp, `idle-${process.hrtime.bigint()}.lock`);
+  fs.writeFileSync(lock, '');
+  const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, MIU_CI_APPLY_LOCKS: lock });
+  assert.equal(r.status, 0);
+});
+
+// A server with plenty free, so only the slots decide.
+const roomy = {};
+
+test('runs side by side while the CI pool has room, and no more', async () => {
+  const sandbox = sandboxHome();
+  const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+  fs.mkdirSync(path.join(dir, 'miu-sandbox-ci-slots'));
+  const first = await holdLock(path.join(dir, 'miu-sandbox-ci-slots', '0.lock'), 'LOCK_EX');
+  try {
+    const env = { ...server({ home: sandbox.home }).env, ...roomy, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') };
+    assert.equal((await runSandboxCi(check, repo(), env)).status, 0, 'a second run fits in a 4 GB, 4 CPU pool');
+    const second = await holdLock(path.join(dir, 'miu-sandbox-ci-slots', '1.lock'), 'LOCK_EX');
+    try {
+      const r = await runSandboxCi(check, repo(), env);
+      assert.match(r.notRun, /all 2 Sandbox CI slots on this server are in use/);
+    } finally { second.kill(); }
+  } finally { first.kill(); }
+});
+
+test('a bigger pool allows more runs at once', async () => {
+  const sandbox = sandboxHome();
+  const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+  fs.mkdirSync(path.join(dir, 'miu-sandbox-ci-slots'));
+  const held = [];
+  for (const i of [0, 1]) held.push(await holdLock(path.join(dir, 'miu-sandbox-ci-slots', `${i}.lock`), 'LOCK_EX'));
+  try {
+    const env = { ...server({ home: sandbox.home }).env, ...roomy, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots'), MIU_CI_POOL_MEM_GB: '8', MIU_CI_POOL_CPUS: '8' };
+    assert.equal((await runSandboxCi(check, repo(), env)).status, 0);
+  } finally { held.forEach((h) => h.kill()); }
+});
+
+test('does not start when the server is short of memory or CPU', async () => {
+  for (const [free, why] of [[{ MIU_CI_FREE_MEM_GB: '5', MIU_CI_FREE_CPUS: '8' }, 'memory'], [{ MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '2.5' }, 'CPU']]) {
+    const sandbox = sandboxHome();
+    const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, ...free, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
+    assert.match(r.notRun ?? '', /this server is busy/, `short of ${why}`);
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, `nothing ran when short of ${why}`);
+  }
 });
 
 test('files the tar brings cannot run or read anything on the server', async () => {

@@ -33,6 +33,94 @@ sb="$HOME/sandbox/sb-src/sb"
 # Inside this script, because Miu's account cannot signal this one to stop it.
 bounded() { timeout -k 10 "$1" "${@:2}"; }
 
+# This server is shared: never start while Sandbox is applying a hosting change.
+# These are the locks a host apply holds (Sandbox's sandbox/resources/host_guard.py),
+# probed shared and non-blocking the same way. sudo resets the environment, so
+# only a test can point these elsewhere.
+apply_locks=${MIU_CI_APPLY_LOCKS:-/run/lock/sandbox-hosting-caddy.lock /run/lock/sandbox-edge-nginx.lock /run/lock/sandbox-docker-pool.lock}
+# shellcheck disable=SC2086
+python3 -I -c '
+import errno, fcntl, os, sys
+for path in sys.argv[1:]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        continue
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            sys.exit(3)
+    finally:
+        os.close(fd)
+' $apply_locks || die "not run: a Sandbox host apply is in progress on this server; try again later"
+# How many runs at once depends on what this server has free. Each run's job
+# container gets a fixed share (run_mem_gb, run_cpus). miu-ci.slice caps them all
+# together (pool_*; install.sh makes it), and a run starts only if the server
+# still keeps `reserve_*` free for everything else once it is going. A run holds
+# one slot: an flock on fd 9, which this script keeps open until it exits.
+# sudo resets the environment, so only a test can change these numbers.
+run_mem_gb=${MIU_CI_RUN_MEM_GB:-2} run_cpus=${MIU_CI_RUN_CPUS:-2}
+pool_mem_gb=${MIU_CI_POOL_MEM_GB:-4} pool_cpus=${MIU_CI_POOL_CPUS:-4}
+reserve_mem_gb=${MIU_CI_RESERVE_MEM_GB:-4} reserve_cpus=${MIU_CI_RESERVE_CPUS:-1}
+# In this account's own home, so Miu's account cannot make the folder first and hold every slot.
+slots=${MIU_CI_SLOTS_DIR:-$HOME/.cache/miu-sandbox-ci-slots}
+mkdir -p -m 0700 "$slots"
+slot=$(python3 -I - "$slots" "$run_mem_gb" "$run_cpus" "$pool_mem_gb" "$pool_cpus" "$reserve_mem_gb" "$reserve_cpus" <<'SLOTS'
+import fcntl, os, sys
+folder = sys.argv[1]
+run_mem, run_cpus, pool_mem, pool_cpus, reserve_mem, reserve_cpus = map(float, sys.argv[2:8])
+most = int(min(pool_mem // run_mem, pool_cpus // run_cpus))
+
+def free_now():
+    # Tests set these; on the server they come from the kernel.
+    mem = os.environ.get("MIU_CI_FREE_MEM_GB")
+    cpus = os.environ.get("MIU_CI_FREE_CPUS")
+    if mem is None:
+        try:
+            with open("/proc/meminfo") as f:
+                info = dict(line.split(":", 1) for line in f)
+            mem = int(info["MemAvailable"].split()[0]) / 1048576
+        except (OSError, KeyError, ValueError):
+            mem = float("inf")
+    if cpus is None:
+        cpus = (os.cpu_count() or 1) - os.getloadavg()[0]
+    return float(mem), float(cpus)
+
+def busy(index):
+    fd = os.open(os.path.join(folder, f"{index}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+if most < 1:
+    sys.exit("not run: Sandbox CI has no room configured on this server")
+mem, cpus = free_now()
+if mem - run_mem < reserve_mem or cpus - run_cpus < reserve_cpus:
+    sys.exit(f"not run: this server is busy ({mem:.1f} GB memory and {max(cpus, 0):.1f} CPUs free); try again later")
+for index in range(most):
+    if not busy(index):
+        print(index)
+        sys.exit(0)
+sys.exit(f"not run: all {most} Sandbox CI slots on this server are in use; try again later")
+SLOTS
+) || exit 2
+[[ $slot =~ ^[0-9]+$ ]] || die "not run: could not take a Sandbox CI slot"
+exec 9>>"$slots/$slot.lock"
+python3 -I -c '
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(3)
+' || die "not run: all Sandbox CI slots on this server are in use; try again later"
+
 root=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci.XXXXXX")
 config=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci-config.XXXXXX")
 cleanup() {
@@ -141,6 +229,9 @@ done
 # could start a container that owns this server.
 mkdir "$config/act"
 echo '--container-daemon-socket=-' > "$config/act/actrc"
+# Every job container is capped and placed in miu-ci.slice (install.sh makes it),
+# so CI cannot crowd out what else runs on this server.
+echo "--container-options --memory=${run_mem_gb}g --memory-swap=${run_mem_gb}g --cpus=${run_cpus} --cgroup-parent=miu-ci.slice" >> "$config/act/actrc"
 export XDG_CONFIG_HOME="$config"
 
 # Workflows expect a git checkout, and an archive has none. Any .git that came
