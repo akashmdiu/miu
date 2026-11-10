@@ -99,14 +99,16 @@ test('the worker runs the commit on this server and never asks for deploy steps'
 test('jobs do not get the Docker socket, and a committed .actrc is ignored', async () => {
   const sandbox = sandboxHome();
   await runSandboxCi(check, repo({ '.actrc': '--privileged\n' }), server({ home: sandbox.home }).env);
-  assert.equal(sandbox.read('actrc').split('\n')[0], '--container-daemon-socket=-');
+  assert.equal(sandbox.read('actrc'), '--container-daemon-socket=-');
   assert.doesNotMatch(sandbox.read('files'), /actrc/);
 });
 
 test('every job container is capped and kept in miu-ci.slice', async () => {
   const sandbox = sandboxHome();
   await runSandboxCi(check, repo(), server({ home: sandbox.home }).env);
-  assert.match(sandbox.read('actrc'), /^--container-options --memory=2g --memory-swap=2g --cpus=2 --cgroup-parent=miu-ci\.slice$/m);
+  const argv = sandbox.read('argv').split('\n');
+  const limits = argv.flatMap((a, i) => (a === '--container-limit' ? [argv[i + 1]] : []));
+  assert.deepEqual(limits, ['memory=2g', 'cpus=2', 'cgroup-parent=miu-ci.slice']);
 });
 
 // Holds an flock on a file, the way a Sandbox host apply or another CI run would.

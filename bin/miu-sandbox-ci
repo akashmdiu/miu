@@ -229,9 +229,6 @@ done
 # could start a container that owns this server.
 mkdir "$config/act"
 echo '--container-daemon-socket=-' > "$config/act/actrc"
-# Every job container is capped and placed in miu-ci.slice (install.sh makes it),
-# so CI cannot crowd out what else runs on this server.
-echo "--container-options --memory=${run_mem_gb}g --memory-swap=${run_mem_gb}g --cpus=${run_cpus} --cgroup-parent=miu-ci.slice" >> "$config/act/actrc"
 export XDG_CONFIG_HOME="$config"
 
 # Workflows expect a git checkout, and an archive has none. Any .git that came
@@ -257,5 +254,9 @@ if len(cells) != 1:
 
 # Never --runtime sandbox: that starts what the repository declares, Compose
 # files included, with this account's Docker access.
+# Every job container is capped and placed in miu-ci.slice (install.sh makes it),
+# so CI cannot crowd out what else runs on this server. A Sandbox too old for
+# --container-limit refuses the run, so CI never runs uncapped.
 bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
-  --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"}
+  --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
+  --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice
