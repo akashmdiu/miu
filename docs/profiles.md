@@ -45,6 +45,33 @@ The quickest way to get one: on the dashboard's **GitHub** page, press **Make a 
 | `cross_repo` | Optional. What the agent should check across repositories, in words. |
 | `not_in_ci` | Optional. Things the QA machine cannot cover. The report lists them as not covered. |
 
+## A CI workflow as a fast check
+
+A fast check can run one of the repository's GitHub Actions workflows instead of a command. Miu runs it with Sandbox on its own server, so the server has to be set up first ([install.md](install.md#ci-workflows-through-sandbox)).
+
+```json
+{
+  "label": "CI",
+  "when": "\\.php$",
+  "sandbox_ci": {
+    "workflow": ".github/workflows/test.yml",
+    "job": "phpunit",
+    "matrix": { "php": "8.3" },
+    "timeout_minutes": 30
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `workflow` | The workflow file, directly in `.github/workflows`. Required. |
+| `job` | The job id to run. Required. |
+| `matrix` | The matrix values to run, when the job has a matrix. They must pick out exactly one combination; add one fast check for each combination you want. |
+| `event` | The GitHub event the run simulates. The default is `pull_request`. |
+| `timeout_minutes` | The time limit, 1 to 240. The default is 30. |
+
+The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/` or `.actrc`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped. A workflow is refused, and reported as not run, if the job (or a job it needs) does not name `ubuntu-latest` or `ubuntu-22.04` in `runs-on` directly, or if its job containers or services mount folders, set Docker options other than `--health-*`, or call a reusable workflow, if the job needs another job and either one has an `if`, or if `.github` holds a symbolic link. The workflow runs on its own: Miu does not start a Sandbox WordPress site for it, because that would run the repository's own Docker setup with the server's Docker access.
+
 ## A plugin and its add-on
 
 Give the add-on its own profile with `"role": "addon"`, and point each profile at the other with `sibling`:

@@ -35,6 +35,7 @@ import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, ensureDeps, CACHE } from '../lib/worktrees.mjs';
+import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
 import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
 
@@ -609,6 +610,7 @@ const runCmd = (cmd, dir) => new Promise((resolve) => {
   child.on('close', (status) => { clearTimeout(timer); resolve({ status, out }); });
   child.on('error', (e) => { clearTimeout(timer); resolve({ status: -1, out: String(e) }); });
 });
+const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars) : runCmd(c.cmd, dir));
 const secs = (t0) => `${Math.round((Date.now() - t0) / 1000)}s`;
 async function runFastChecks() {
   writeFast(false);
@@ -616,19 +618,21 @@ async function runFastChecks() {
   for (const c of profile.fast_checks ?? []) {
     if (!prSrc) { fastLines.set(c.label, `- ${c.label}: not run (no PR checkout)`); continue; }
     if (mode !== 'full' || !touches(c.when)) { fastLines.set(c.label, `- ${c.label}: not run (diff does not touch it)`); continue; }
+    if (c.sandbox_ci && changesCiDefinition(files)) { fastLines.set(c.label, `- ${c.label}: not run (this PR changes the CI definition, and a PR must not choose what runs on the server)`); continue; }
     log(`check ${c.label}: running`);
     fastLines.set(c.label, `- ${c.label}: running`); writeFast(false);
     const t0 = Date.now();
-    const r = await runCmd(c.cmd, prSrc);
+    const r = await runCheck(c, prSrc);
+    if (r.notRun) { fastLines.set(c.label, `- ${c.label}: not run (${r.notRun})`); log(`check ${c.label}: not run, ${r.notRun}`); writeFast(false); continue; }
     let line = `- ${c.label}: ${r.status === 0 ? 'passed' : `FAILED (exit ${r.status})`}`;
     log(`check ${c.label}: ${r.status === 0 ? 'passed' : 'failed'} in ${secs(t0)}`);
     if (r.status !== 0 && slotInfo[devLabel]) {
       log(`check ${c.label}: running on dev to compare`);
       devSrc = checkSlot(devLabel);
-      const d = await runCmd(c.cmd, devSrc);
+      const d = await runCheck(c, devSrc);
       prSrc = checkSlot(prLabel);
-      line += d.status === 0 ? ', passes on dev, so this PR introduced it' : ', also fails on dev, so it is not from this PR';
-      log(`check ${c.label}: ${d.status === 0 ? 'passes on dev' : 'also fails on dev'}`);
+      line += d.notRun ? `, could not be compared with dev (${d.notRun})` : d.status === 0 ? ', passes on dev, so this PR introduced it' : ', also fails on dev, so it is not from this PR';
+      log(`check ${c.label}: ${d.notRun ? 'no comparison with dev' : d.status === 0 ? 'passes on dev' : 'also fails on dev'}`);
     }
     fastLines.set(c.label, [line, '', '```', r.out.split('\n').filter((l) => !/^\.+\s+\d+ \/ \d+/.test(l)).slice(-40).join('\n'), '```', ''].join('\n'));
     writeFast(false);

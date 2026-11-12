@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Run one GitHub Actions workflow with the Sandbox CLI on this server.
+#
+# Installed as /usr/local/lib/miu/sandbox-ci. It runs as the account that owns
+# Sandbox, through the one sudo rule install.sh --sandbox-user adds, because
+# Miu's own account has no Docker access. The pull request's files arrive as a
+# tar on stdin, so that account never reads Miu's folders.
+#
+#   sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]
+#
+# Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
+# tar is trusted: that account can reach Docker, and Miu's account cannot.
+set -euo pipefail
+
+die() { echo "$*" >&2; exit 2; }
+[ $# -ge 4 ] || die "usage: sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]"
+workflow=$1 event=$2 seconds=$3 job=$4
+shift 4
+
+[[ $workflow =~ ^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$ ]] || die "not a workflow path: $workflow"
+[[ $event =~ ^[a-z_]{1,64}$ ]] || die "not an event name: $event"
+[[ $seconds =~ ^[0-9]{1,5}$ ]] || die "not a timeout: $seconds"
+[[ $job =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "not a job id: $job"
+matrix_args=()
+for pair in "$@"; do
+  [[ $pair =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*=[A-Za-z0-9_.-]+$ ]] || die "not a matrix value: $pair"
+  matrix_args+=(--matrix-filter "$pair")
+done
+
+sb="$HOME/sandbox/sb-src/sb"
+[ -x "$sb" ] || die "no Sandbox CLI at $sb"
+
+# Inside this script, because Miu's account cannot signal this one to stop it.
+bounded() { timeout -k 10 "$1" "${@:2}"; }
+
+# This server is shared: never start while Sandbox is applying a hosting change.
+# These are the locks a host apply holds (Sandbox's sandbox/resources/host_guard.py),
+# probed shared and non-blocking the same way. sudo resets the environment, so
+# only a test can point these elsewhere.
+apply_locks=${MIU_CI_APPLY_LOCKS:-/run/lock/sandbox-hosting-caddy.lock /run/lock/sandbox-edge-nginx.lock /run/lock/sandbox-docker-pool.lock}
+# shellcheck disable=SC2086
+python3 -I -c '
+import errno, fcntl, os, sys
+for path in sys.argv[1:]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        continue
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            sys.exit(3)
+    finally:
+        os.close(fd)
+' $apply_locks || die "not run: a Sandbox host apply is in progress on this server; try again later"
+# How many runs at once depends on what this server has free. Each run's job
+# container gets a fixed share (run_mem_gb, run_cpus). miu-ci.slice caps them all
+# together (pool_*; install.sh makes it), and a run starts only if the server
+# still keeps `reserve_*` free for everything else once it is going. A run holds
+# one slot: an flock on fd 9, which this script keeps open until it exits.
+# sudo resets the environment, so only a test can change these numbers.
+run_mem_gb=${MIU_CI_RUN_MEM_GB:-2} run_cpus=${MIU_CI_RUN_CPUS:-2}
+pool_mem_gb=${MIU_CI_POOL_MEM_GB:-4} pool_cpus=${MIU_CI_POOL_CPUS:-4}
+reserve_mem_gb=${MIU_CI_RESERVE_MEM_GB:-4} reserve_cpus=${MIU_CI_RESERVE_CPUS:-1}
+# In this account's own home, so Miu's account cannot make the folder first and hold every slot.
+slots=${MIU_CI_SLOTS_DIR:-$HOME/.cache/miu-sandbox-ci-slots}
+mkdir -p -m 0700 "$slots"
+slot=$(python3 -I - "$slots" "$run_mem_gb" "$run_cpus" "$pool_mem_gb" "$pool_cpus" "$reserve_mem_gb" "$reserve_cpus" <<'SLOTS'
+import fcntl, os, sys
+folder = sys.argv[1]
+run_mem, run_cpus, pool_mem, pool_cpus, reserve_mem, reserve_cpus = map(float, sys.argv[2:8])
+most = int(min(pool_mem // run_mem, pool_cpus // run_cpus))
+
+def free_now():
+    # Tests set these; on the server they come from the kernel.
+    mem = os.environ.get("MIU_CI_FREE_MEM_GB")
+    cpus = os.environ.get("MIU_CI_FREE_CPUS")
+    if mem is None:
+        try:
+            with open("/proc/meminfo") as f:
+                info = dict(line.split(":", 1) for line in f)
+            mem = int(info["MemAvailable"].split()[0]) / 1048576
+        except (OSError, KeyError, ValueError):
+            mem = float("inf")
+    if cpus is None:
+        cpus = (os.cpu_count() or 1) - os.getloadavg()[0]
+    return float(mem), float(cpus)
+
+def busy(index):
+    fd = os.open(os.path.join(folder, f"{index}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+if most < 1:
+    sys.exit("not run: Sandbox CI has no room configured on this server")
+mem, cpus = free_now()
+if mem - run_mem < reserve_mem or cpus - run_cpus < reserve_cpus:
+    sys.exit(f"not run: this server is busy ({mem:.1f} GB memory and {max(cpus, 0):.1f} CPUs free); try again later")
+for index in range(most):
+    if not busy(index):
+        print(index)
+        sys.exit(0)
+sys.exit(f"not run: all {most} Sandbox CI slots on this server are in use; try again later")
+SLOTS
+) || exit 2
+[[ $slot =~ ^[0-9]+$ ]] || die "not run: could not take a Sandbox CI slot"
+exec 9>>"$slots/$slot.lock"
+python3 -I -c '
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(3)
+' || die "not run: all Sandbox CI slots on this server are in use; try again later"
+
+root=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci.XXXXXX")
+config=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci-config.XXXXXX")
+cleanup() {
+  # A job stopped at its time limit leaves its containers behind.
+  for id in $(bounded 30 docker ps -aq --filter name=act- 2>/dev/null || true); do
+    if bounded 30 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null | grep -qF "${root##*/}"; then
+      bounded 30 docker rm -f "$id" >/dev/null 2>&1 || true
+    fi
+  done
+  # Jobs run as root in their containers, so what they wrote needs root to remove.
+  bounded 120 docker run --rm --pull=never -v "$root:/work" --entrypoint find catthehacker/ubuntu:act-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
+  bounded 120 rm -rf "$root" "$config" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+bounded 300 tar -x -C "$root"
+[ -f "$root/$workflow" ] || die "the pull request has no $workflow"
+
+# Miu's account runs pull request code in its fast checks, so it can call this
+# script with any tar. Before act sees the workflow, check what it asks of Docker.
+if [ -n "$(find "$root/.github" -type l -print -quit)" ]; then die "refused: a symbolic link under .github"; fi
+bounded 60 python3 -I - "$root/$workflow" "$job" <<'POLICY'
+import os, shlex, sys
+import yaml
+
+path = sys.argv[1]
+
+def refuse(why):
+    sys.exit(f"refused: {os.path.basename(path)}: {why}")
+
+def check(what, c):
+    if not isinstance(c, dict):
+        refuse(f"{what} must be a mapping")
+    extra = set(map(str, c)) - {"image", "env", "ports", "credentials", "options"}
+    if extra:
+        refuse(f"{what} sets {', '.join(sorted(extra))}")
+    options = c.get("options")
+    if options is None:
+        return
+    # act splits these with a different parser, which joins escaped lines.
+    if not isinstance(options, str) or "${{" in options or "\\" in options or any(ord(ch) < 32 and ch not in "\t\n" for ch in options):
+        refuse(f"{what} has options that are not plain text")
+    for word in shlex.split(options):
+        if word.startswith("-") and not word.startswith("--health-"):
+            refuse(f"{what} has the option {word}")
+
+try:
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f)
+except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
+    refuse("not readable as YAML")
+jobs = doc.get("jobs") if isinstance(doc, dict) else None
+if not isinstance(jobs, dict):
+    refuse("no jobs mapping")
+for job_id, job in jobs.items():
+    if not isinstance(job, dict):
+        refuse(f"job {job_id} must be a mapping")
+    # act opens a called workflow when it reaches it, after earlier jobs could
+    # have rewritten it in the shared workspace.
+    if job.get("uses") is not None:
+        refuse(f"job {job_id} calls another workflow")
+    # A key that is not a string reads differently in the plan and in the run,
+    # so the count of runs below would not hold.
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if isinstance(matrix, dict):
+        rows = [matrix] + [r for k in ("include", "exclude") if isinstance(matrix.get(k), list) for r in matrix[k]]
+        if any(not isinstance(k, str) for r in rows if isinstance(r, dict) for k in r):
+            refuse(f"job {job_id} has a matrix name that is not text")
+    container = job.get("container")
+    if container is not None and not isinstance(container, str):
+        check(f"job {job_id} container", container)
+    services = job.get("services")
+    if services is not None:
+        if not isinstance(services, dict):
+            refuse(f"job {job_id} services must be a mapping")
+        for service_id, service in services.items():
+            check(f"service {service_id}", service)
+
+# act skips a job on a label with no runner and exits 0, and quotes the label in
+# its log. The job that runs, and what it needs, must be on a label Sandbox maps.
+seen, todo = set(), [sys.argv[2]]
+while todo:
+    job_id = todo.pop()
+    if job_id in seen or job_id not in jobs:
+        continue
+    seen.add(job_id)
+    if jobs[job_id].get("runs-on") not in ("ubuntu-latest", "ubuntu-22.04"):
+        refuse(f"job {job_id} must run on ubuntu-latest or ubuntu-22.04")
+    needs = jobs[job_id].get("needs") or []
+    todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+# A job skipped by its condition leaves the success of the job it needs as the
+# only result in the log, and that would read as its own.
+if len(seen) > 1 and any("if" in jobs[j] for j in seen):
+    refuse("a job with needs cannot have a condition")
+POLICY
+
+# act runs on this server and reads these from the folder it runs in. .actrc is
+# options for act. The others are values for the job, and a link there would
+# hand a job a file from this server. A plain file holds nothing new.
+bounded 60 rm -rf "$root/.actrc"
+for f in .env .vars .input .secrets; do
+  if [ -L "$root/$f" ]; then rm -f "$root/$f"; fi
+done
+# act's own settings keep the Docker socket out of jobs: with the socket a job
+# could start a container that owns this server.
+mkdir "$config/act"
+echo '--container-daemon-socket=-' > "$config/act/actrc"
+export XDG_CONFIG_HOME="$config"
+
+# Workflows expect a git checkout, and an archive has none. Any .git that came
+# in the tar is not ours, and its hooks would run here.
+bounded 120 rm -rf "$root/.git"
+quiet_git() { bounded 120 git -C "$root" -c core.hooksPath=/dev/null -c user.name=miu -c user.email=miu@localhost "$@"; }
+quiet_git init -q
+quiet_git add -A
+quiet_git commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
+
+# One job and one matrix combination, so one act process. A job can write to the
+# workspace, and a second process would read an .actrc the first one left there.
+# Sandbox starts one act per combination; each of those is its own fast check.
+plan=$(bounded 60 "$sb" ci plan "$root/$workflow" --json)
+bounded 30 python3 -I -c '
+import json, sys
+job, pairs = sys.argv[1], [a.split("=", 1) for a in sys.argv[2:]]
+plan = json.loads([l for l in sys.stdin if l.startswith("{")][-1])
+cells = [c for j in plan["jobs"] if j["id"] == job for c in j["cells"] if all(str(c["matrix"].get(k)) == v for k, v in pairs)]
+if len(cells) != 1:
+    sys.exit(f"refused: {len(cells)} matching runs of job {job}; a check runs exactly one, so name the matrix values")
+' "$job" "$@" <<<"$plan"
+
+# Never --runtime sandbox: that starts what the repository declares, Compose
+# files included, with this account's Docker access.
+# Every job container is capped and placed in miu-ci.slice (install.sh makes it),
+# so CI cannot crowd out what else runs on this server. A Sandbox too old for
+# --container-limit refuses the run, so CI never runs uncapped.
+bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
+  --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
+  --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice

@@ -43,6 +43,18 @@ Read [install.sh](../install.sh) before you run it. It changes the server as roo
 
 Codex runs commands inside bwrap. Ubuntu 24.04 lets a program create the user namespace that bwrap needs only if the program has an AppArmor profile. The installer adds a profile for the bwrap that ships with Codex, and for nothing else.
 
+## CI workflows through Sandbox
+
+Optional. A profile's fast check can run a GitHub Actions workflow ([profiles.md](profiles.md#a-ci-workflow-as-a-fast-check)) on this server, using Sandbox. Set Sandbox up on the server first, with `sb remote provision` from your own machine, and install [act](https://github.com/nektos/act) on it. Then name the account that owns Sandbox:
+
+```sh
+sudo bash install.sh --sandbox-user ubuntu
+```
+
+`miu` stays out of the `docker` group. The installer adds one sudo rule, `/etc/sudoers.d/miu-sandbox-ci`, that lets `miu` run `/usr/local/lib/miu/sandbox-ci` as that account and nothing else. The script gets the commit as a tar on stdin, runs it in a temporary folder and removes the folder afterwards. It expects Sandbox at `~/sandbox/sb-src/sb`.
+
+Workflow steps run the pull request's code in Docker containers on this server, without the Docker socket. Give a workflow only the CI secrets you would give that code: the `ci_secrets` in the Sandbox account's `sandbox.local.yml`. A workflow that needs a secret with no entry there is reported as not run.
+
 ## After the installer
 
 1. **Owner account.** Open the address and go to `/auth/setup`. Enter the setup code the installer printed. You can also read it with `sudo cat /home/miu/.config/miu/setup-code`.
@@ -70,7 +82,7 @@ journalctl -u miu -n 50
 
 ```sh
 sudo systemctl disable --now miu rexenv-headless
-sudo rm -rf /srv/miu /opt/miu /etc/miu /usr/local/lib/miu /etc/sudoers.d/miu /etc/apparmor.d/miu-codex-bwrap \
+sudo rm -rf /srv/miu /opt/miu /etc/miu /usr/local/lib/miu /etc/sudoers.d/miu /etc/sudoers.d/miu-sandbox-ci /etc/apparmor.d/miu-codex-bwrap \
   /etc/systemd/system/miu.service /etc/credstore.encrypted/miu-secrets-key /etc/caddy/conf.d/miu
 sudo userdel -r miu-agent; sudo userdel -r miu
 sudo apt-get remove rexenv

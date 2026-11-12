@@ -12,6 +12,8 @@
 #   --user NAME     the account Miu runs as (default: miu; an existing one is kept)
 #   --agent-user NAME  the account the AI agent runs as (default: miu-agent)
 #   --no-agent-user run the AI agent as Miu's own account (not recommended)
+#   --sandbox-user NAME  let Miu run CI workflows through Sandbox, as this account
+#                   (the one that owns Sandbox on this server); see docs/install.md
 #
 # What it sets up (docs/install.md has the detail):
 #   - two accounts: `miu` runs the dashboard, rexenv and holds every secret;
@@ -31,6 +33,7 @@ AGENT_USER_ON=1
 NODE_MAJOR=24
 MIU_USER=miu
 AGENT_USER=miu-agent
+SANDBOX_USER=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,7 +43,8 @@ while [ $# -gt 0 ]; do
     --user) MIU_USER="${2:-}"; shift 2 ;;
     --agent-user) AGENT_USER="${2:-}"; shift 2 ;;
     --no-agent-user) AGENT_USER_ON=0; shift ;;
-    -h|--help) sed -n '2,23p' "$0" 2>/dev/null || true; exit 0 ;;
+    --sandbox-user) SANDBOX_USER="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,25p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -57,7 +61,7 @@ command -v systemctl >/dev/null || die "Miu needs systemd."
 case "$(uname -m)" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) die "Miu runs on x86_64 and arm64; this is $(uname -m)." ;; esac
 if [ -n "$DOMAIN" ] && ! [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then die "--domain takes a host name, like miu.example.com"; fi
 [[ "$MIU_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "--ref takes a branch or tag name"
-for u in "$MIU_USER" "$AGENT_USER"; do [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "not an account name: $u"; done
+for u in "$MIU_USER" "$AGENT_USER" ${SANDBOX_USER:+"$SANDBOX_USER"}; do [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "not an account name: $u"; done
 [ "$MIU_USER" != "$AGENT_USER" ] || die "--user and --agent-user must differ"
 
 APP=/srv/miu
@@ -272,6 +276,42 @@ if [ -n "$DOMAIN" ]; then
   setenv MIU_PUBLIC_URL "https://$DOMAIN"
   # Behind the proxy every request comes from 127.0.0.1: require sign-in from the start.
   setenv MIU_AUTH github
+fi
+
+# A later run without --sandbox-user keeps the account an earlier run set. That
+# is kept where only root can write: it decides a sudo rule, and $ENVF is $MIU_USER's.
+[ -n "$SANDBOX_USER" ] || SANDBOX_USER=$(cat "$LIB/sandbox-user" 2>/dev/null || true)
+if [ -n "$SANDBOX_USER" ]; then
+  [ "$SANDBOX_USER" != root ] || die "--sandbox-user: use the account that owns Sandbox, not root"
+  id "$SANDBOX_USER" >/dev/null 2>&1 || die "--sandbox-user: no account named $SANDBOX_USER"
+  say "Letting Miu run CI workflows as $SANDBOX_USER"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null
+  install -d -m 0755 "$LIB"
+  echo "$SANDBOX_USER" > "$LIB/sandbox-user"
+  install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
+  # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
+  # together; stop them all with: systemctl stop miu-ci.slice
+  cat > /etc/systemd/system/miu-ci.slice <<SLICE
+[Unit]
+Description=Miu's Sandbox CI job containers (capped)
+[Slice]
+MemoryAccounting=yes
+MemoryMax=4G
+CPUWeight=20
+CPUQuota=400%
+SLICE
+  systemctl daemon-reload
+  cat > /etc/sudoers.d/miu-sandbox-ci.tmp <<EOF
+# $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
+$MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci
+EOF
+  visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
+  chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
+  setenv MIU_SANDBOX_USER "$SANDBOX_USER"
+  setenv MIU_SANDBOX_WORKER "$LIB/sandbox-ci"
+  # Sandbox runs act with --pull=false, so the runner image has to be here already.
+  sudo -u "$SANDBOX_USER" -H docker pull -q catthehacker/ubuntu:act-22.04 >/dev/null || say "Could not pull the CI runner image as $SANDBOX_USER; CI workflows will fail until it is there."
+  sudo -u "$SANDBOX_USER" -H sh -c 'command -v act' >/dev/null || say "act is not installed for $SANDBOX_USER; CI workflows will report \"not run\" until it is."
 fi
 
 # The unit below loads the key itself; an older drop-in that did would load it twice.
