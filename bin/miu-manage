@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+// Service credentials use bounded stdin. Owner bootstrap display is human-terminal-only.
+import path from 'node:path';
+import os from 'node:os';
+import { CredentialStore } from '../lib/management-auth.mjs';
+
+const invalid = (code = 'invalid_arguments') => { throw Object.assign(new Error(code), { code }); };
+function argumentsOf(argv) {
+  const [command, ...rest] = argv;
+  if (!['credential-set', 'credential-revoke'].includes(command)) invalid();
+  const options = { command, scopes: [], repositories: [] };
+  const seen = new Set();
+  for (let index = 0; index < rest.length; index += 1) {
+    const flag = rest[index];
+    if (flag === '--stdin' && command === 'credential-set' && !seen.has(flag)) {
+      options.stdin = true; seen.add(flag); continue;
+    }
+    if (!['--directory', '--id', '--scope', '--repository'].includes(flag)) invalid();
+    if (command !== 'credential-set' && ['--scope', '--repository'].includes(flag)) invalid();
+    if (seen.has(flag) && !['--scope', '--repository'].includes(flag)) invalid();
+    const value = rest[++index];
+    if (typeof value !== 'string' || !value || value.startsWith('--')) invalid();
+    seen.add(flag);
+    if (flag === '--scope') options.scopes.push(value);
+    else if (flag === '--repository') options.repositories.push(value);
+    else options[flag.slice(2)] = value;
+  }
+  if (!options.id || (command === 'credential-set' && (!options.stdin || !options.scopes.length))) invalid();
+  options.directory ??= path.join(os.homedir(), '.config', 'miu', 'management');
+  if (!path.isAbsolute(options.directory)) invalid();
+  return options;
+}
+
+function secretInput() {
+  if (process.stdin.isTTY) invalid('protected_stdin_required');
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let finished = false;
+    const stop = (error, value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      process.stdin.removeAllListeners('data');
+      process.stdin.removeAllListeners('end');
+      process.stdin.pause();
+      process.stdin.destroy();
+      if (error) reject(error); else resolve(value);
+    };
+    const refusal = () => Object.assign(new Error('invalid_input'), { code: 'invalid_input' });
+    const timer = setTimeout(() => stop(refusal()), 3000);
+    process.stdin.on('error', () => stop(refusal()));
+    process.stdin.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 514) return stop(refusal());
+      chunks.push(chunk);
+    });
+    process.stdin.on('end', () => {
+      const value = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
+      if (!/^[\x21-\x7e]{32,512}$/.test(value)) stop(refusal());
+      else stop(null, value);
+    });
+  });
+}
+
+try {
+  if (process.argv[2] === 'owner-setup') {
+    if (process.argv.length !== 3) invalid();
+    if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stderr.isTTY) invalid('human_terminal_required');
+    const users = await import('../lib/users.mjs');
+    if (users.hasUsers()) invalid('owner_exists');
+    // This command is for the human operator; agents must not invoke it in a PTY.
+    console.log(users.setupCode());
+  } else {
+  const options = argumentsOf(process.argv.slice(2));
+  const store = new CredentialStore({ directory: options.directory });
+  if (options.command === 'credential-revoke') {
+    console.log(JSON.stringify({ ok: true, revoked: await store.revoke(options.id) }));
+  } else {
+    const principal = await store.provision({ id: options.id, secret: await secretInput(),
+      scopes: options.scopes, repositories: options.repositories });
+    console.log(JSON.stringify({ ok: true, principal }));
+  }
+  }
+} catch (error) {
+  const codes = new Set(['invalid_arguments', 'protected_stdin_required', 'invalid_input', 'invalid_credential',
+    'repositories_required', 'store_limit', 'provision_busy', 'unsafe_storage', 'storage_unavailable', 'credential_outcome_unknown', 'human_terminal_required', 'owner_exists']);
+  console.log(JSON.stringify({ ok: false, code: codes.has(error?.code) ? error.code : 'operation_failed' }));
+  process.exitCode = 2;
+}

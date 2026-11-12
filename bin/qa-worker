@@ -1,0 +1,82 @@
+#!/usr/bin/env node
+// Internal IPC worker. Public starts go through shared admission in qa-run/dashboard.
+import path from 'node:path';
+import fs from 'node:fs';
+import { configureGitHubPolicy } from '../lib/github-policy.mjs';
+import { parseQaArguments } from '../lib/management-cli-intent.mjs';
+import { readManagementConfiguration } from '../lib/management-service.mjs';
+
+if (!process.connected || typeof process.send !== 'function') {
+  console.error('QA worker requires an admitted IPC parent');
+  process.exitCode = 2;
+} else {
+  const cancellation = new AbortController();
+  let admitted;
+  const onMessage = (message) => {
+    if (admitted && message?.type === 'miu-cancel' && message.requestId === admitted.requestId
+        && message.runName === admitted.runName) cancellation.abort();
+  };
+  process.on('message', onMessage);
+  process.on('SIGTERM', () => cancellation.abort());
+  process.on('SIGINT', () => cancellation.abort());
+  process.on('disconnect', () => cancellation.abort());
+  try {
+    const admission = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('admission_timeout')), 5000);
+      process.once('message', (message) => {
+        clearTimeout(timer);
+        if (message?.type !== 'miu-admitted' || !message.record) reject(new Error('invalid_admission'));
+        else resolve(message);
+      });
+    });
+    const record = admission.record;
+    const intent = record.intent;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(record.requestId ?? '')
+        || record.runName !== path.basename(process.cwd()) || !intent
+        || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(intent.repo ?? '')
+        || !Number.isSafeInteger(intent.pr) || intent.pr < 1) throw new Error('invalid_admission');
+    admitted = record;
+    const legacy = record.principalId === '_dashboard';
+    const appOnly = !legacy || intent.policy === 'app-only';
+    if (appOnly) {
+      const configuration = readManagementConfiguration(admission.managementDirectory);
+      if (!configuration || fs.realpathSync(configuration.runsDirectory) !== fs.realpathSync(path.dirname(process.cwd()))) throw new Error('invalid_admission');
+    }
+    let argv;
+    if (legacy) {
+      if (!Array.isArray(intent.argv) || intent.argv.length > 200
+          || intent.argv.some((arg) => typeof arg !== 'string' || arg.length > 4096)
+          || Buffer.byteLength(JSON.stringify(intent.argv)) > 16384) throw new Error('invalid_admission');
+      argv = [...intent.argv];
+      if (parseQaArguments(argv).has('--run-dir')) throw new Error('invalid_admission');
+    } else {
+      if (![intent.baseSha, intent.headSha].every((sha) => /^[a-f0-9]{40}$/.test(sha ?? ''))
+          || intent.trust !== 'trusted' || !['report-only', 'publish'].includes(intent.mode)
+          || !['plan', 'api'].includes(intent.authMode)
+          || typeof intent.model !== 'string') throw new Error('invalid_admission');
+      argv = ['--repo', intent.repo, '--pr', String(intent.pr), '--model', intent.model, '--auth', intent.authMode];
+      if (intent.mode === 'report-only') argv.push('--dry-run');
+    }
+    if (appOnly) configureGitHubPolicy({ mode: 'app-only', repositories: [intent.repo] });
+    if (appOnly && parseQaArguments(argv).flag('--slack')) throw new Error('unsupported_external_channel');
+    if (appOnly && intent.mode === 'report-only' && !parseQaArguments(argv).flag('--dry-run')) argv.push('--dry-run');
+    argv.push('--run-dir', process.cwd());
+    const { runQa } = await import('../lib/qa-run-worker.mjs');
+    const result = await runQa({ argv, signal: cancellation.signal, admitted: appOnly ? record : null,
+      managementDirectory: admission.managementDirectory });
+    process.exitCode = result.exitCode;
+    const revisionsMatch = !appOnly || (result.baseSha === intent.baseSha && result.headSha === intent.headSha)
+      || (result.refusedBeforeExecution === true && (result.exitCode !== 0 || result.cancelled === true));
+    await new Promise((resolve) => process.send({ type: 'miu-complete', requestId: record.requestId,
+      runName: record.runName, baseSha: intent.baseSha, headSha: intent.headSha,
+      outcome: result.outcome,
+      cleanupComplete: result.cleanupComplete === true && revisionsMatch, cancelled: result.cancelled === true }, resolve));
+  } catch {
+    // Missing completion proof deliberately leaves the parent's durable capacity fenced.
+    console.error('QA worker could not prove completion');
+    process.exitCode = 1;
+  } finally {
+    process.off('message', onMessage);
+    if (process.connected) process.disconnect();
+  }
+}

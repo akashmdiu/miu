@@ -60,6 +60,7 @@ On your server only, as files. The code under test goes to GitHub and to the AI 
 - [Install in detail](docs/install.md): what the installer changes, updating, removing
 - [Profiles](docs/profiles.md): every setting for a repository
 - [Security](docs/security.md): sign-in, roles, and how secrets are kept
+- [Management API development](docs/management-api.md): proposed service interface and remaining integration work
 - [How a test is done](docs/methodology.md): the method the agent follows
 
 ## Licence
