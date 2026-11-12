@@ -736,6 +736,15 @@ setInterval(pump, 15 * 1000);
 // the raw Codex events go after TRANSCRIPT_DAYS; their numbers stay in
 // usage.json, so stats keep the run.
 const WORK_DIRS = ['scratch', 'tmp', 'work', 'src', 'builds', 'stage'];
+// The agent names its build copies as it likes (qa-build, build-verify,
+// asset-check, ...), so WORK_DIRS misses them. Their installed dependencies
+// are found by name at any depth instead: 48 runs had kept 8.8 GB of them.
+const DEP_DIRS = ['node_modules', 'qa-npm-cache', '.npm', 'ms-playwright'];
+function depDirs(dir) {
+  const name = DEP_DIRS.flatMap((d, i) => (i ? ['-o', '-name', d] : ['-name', d]));
+  const r = spawnSync('find', [dir, '-mindepth', '1', '-type', 'd', '(', ...name, ')', '-prune', '-print0'], { encoding: 'utf8' });
+  return (r.stdout || '').split('\0').filter(Boolean);
+}
 const TRANSCRIPT_DAYS = Number(process.env.MIU_TRANSCRIPT_DAYS || 30);
 const SHOT_DAYS = Number(process.env.MIU_SHOT_DAYS || 7);
 // Cloudinary keeps a closed pull request's screenshots for CLOSED_DAYS, then
@@ -791,6 +800,7 @@ function pruneRuns() {
       freed += size(p);
       rmAny(p);
     }
+    for (const p of depDirs(dir)) { freed += size(p); rmAny(p); }
     // A screenshot already on Cloudinary leaves this disk after SHOT_DAYS;
     // /evidence/ then redirects to the uploaded copy.
     const up = readJson(path.join(dir, 'screenshots.json')) ?? {};
