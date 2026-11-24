@@ -12,7 +12,7 @@ This is how a QA engineer tests a pull request, written down from one person's r
    - **B.** Free branch + Pro, licensed (the plugin reports an active licence). Sub-cases: licence revoked, a conflicting plugin active.
    - **C.** Pro branch on the current Free `dev`, to prove a Pro PR does not break a site that has not updated Free yet. A boot sweep is enough.
 
-   When a Free PR and a Pro PR belong together (same branch name, or the body names the other), they are tested together and the report says so on its first line.
+   When [Miu pairs a Free PR with a Pro PR](profiles.md#a-plugin-and-its-add-on), it tests them together and names them on the first line of the report.
 5. **Probe each criterion through every layer it touches.** UI in a real browser, REST, WP-CLI, the database, files on disk, served HTTP headers and bytes, logs. A setting is not "saved" until it is read back from the option.
 6. **Edge cases come from the change.** There is no generic checklist. Typical ones from past reports: plain permalinks (`?page_id=2`), a subfolder install, a lapsed licence, an unrelated plugin's markup, a file changed on disk after the plugin recorded it, one item where the copy assumes many, Imagick without JPEG support.
 7. **Sweep for regressions** around the change: neighbouring tabs and panels still render, no PHP warnings in the container log, no console errors other than the ones the test caused on purpose.
