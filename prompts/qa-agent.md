@@ -86,7 +86,7 @@ Every turn re-reads the whole conversation, so the cost and the time of a run gr
 <!-- only:pair -->
 ## Paired run (when `context/pair.json` lists PRs)
 
-The PRs in `context/pair.json` belong with this one: they were opened to be tested together (same branch name, or one names the other). One run tests the whole pair, and the report goes on every PR of it.
+Test the PRs listed in `context/pair.json` together with this PR. One run tests the whole pair, and the report goes on every PR of it.
 
 - **What each side runs.** `qa-pr.rex` runs every plugin PR of the pair (and dev for a plugin with no PR in the pair); `qa-dev.rex` runs dev of both plugins. When the pair has a Hub PR, `qa-pr.rex` is wired to the **pr** Hub and `qa-dev.rex` to the **dev** Hub (the URL constant in wp-config, `hub` in `context/sites.json`). So the before is dev talking to dev, and the after is the pair talking to each other.
 - **Criteria come from every PR of the pair**: read each PR's body and diff in `context/pair/`. Give every criterion a `"pr"` field: the PR whose claim it is, as `owner/repo#n` (for example `acme/shop-hub#478`). A criterion about how the PRs work together (the request one builds and the other accepts, a result one returns and the other stores) has no `"pr"`: it counts for every PR. Do the same for issues. Each PR's verdict is computed from its own criteria and issues plus the shared ones.

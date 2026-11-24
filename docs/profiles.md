@@ -55,7 +55,11 @@ Give the add-on its own profile with `"role": "addon"`, and point each profile a
   "combos": ["B", "B-unlicensed", "C"], "licence": "Set the option shop_pro_license_status to valid with wp option update." }
 ```
 
-Two pull requests are tested together when their branches have the same name, or when one names the other in its body (`acme/shop-pro#12`, or `Pro #12`, using the profile's `label`). The "after" site runs both pull requests and the "before" site runs both base branches. Each pull request gets its own comment and verdict.
+Put the open PRs to test together under `## Test together` in the starting PR's description. Use a GitHub PR link, `acme/shop-pro#12`, or `Pro #12` using the profile's label. Write `None.` for a standalone run. Links under `## Stack` or `## Related PRs` do not affect pairing when `## Test together` is present.
+
+If the starting PR has no `## Test together` section, Miu falls back to matching branch names and PR references in descriptions.
+
+The "after" site runs both pull requests and the "before" site runs both base branches. Each pull request gets its own comment and verdict.
 
 ## project.json and project.md
 
